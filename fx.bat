@@ -3,8 +3,8 @@ rem FX-NEWS launcher for Windows. Finds Python 3 and runs run.py with the given 
 setlocal
 cd /d "%~dp0"
 set "PY="
-py -3 --version >nul 2>nul
-if not errorlevel 1 set "PY=py -3"
+py --version >nul 2>nul
+if not errorlevel 1 set "PY=py"
 if not defined PY (
   python --version >nul 2>nul
   if not errorlevel 1 set "PY=python"
