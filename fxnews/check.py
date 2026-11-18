@@ -38,14 +38,16 @@ def run_check(cfg, sources, out=print):
         try:
             entries = poller.fetch() or []
             took = time.time() - start
-            # もう一度たのんで、「前回から変わっていません(304)」という短い返事をもらえるかを見る
-            unchanged = poller.fetch() is None
             per_day = 86400.0 / poller.interval
+            if poller.interval < 120:
+                # もう一度たのんで、「前回から変わっていません(304)」という短い返事をもらえるかを見る
+                unchanged = poller.fetch() is None
+                note = "あり" if unchanged else "なし(毎回ぜんぶ受け取る)"
+            else:
+                unchanged = False  # 見に行く間隔が長い相手には、ためしの2回目をたのまない
+                note = "ためしていない(%d秒おきの相手)" % poller.interval
             daily_bytes += per_day * (HEADER_BYTES + (0 if unchanged else poller.last_wire))
-            size = "受け取り %dKB、変更なしの短い返事: %s" % (
-                max(1, poller.last_wire // 1000),
-                "あり" if unchanged else "なし(毎回ぜんぶ受け取る)",
-            )
+            size = "受け取り %dKB、変更なしの短い返事: %s" % (max(1, poller.last_wire // 1000), note)
             if entries:
                 newest = max(entries, key=lambda e: e["published"] or 0)
                 when = jst(newest["published"], "%m/%d %H:%M") if newest["published"] else "時刻なし"

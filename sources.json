@@ -49,7 +49,8 @@
       "name": "トランプ大統領の投稿(保存サイト経由)",
       "url": "https://www.trumpstruth.org/feed?start_date={yesterday}",
       "kind": "vip",
-      "interval_sec": 60
+      "interval_sec": 180,
+      "memo": "有志の保存サイト。数秒のうちに3回たのんだら「たのみすぎ(429)」と断られたので、3分おきにしている。"
     }
   ],
   "edgar": {
