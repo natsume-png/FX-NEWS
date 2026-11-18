@@ -1,0 +1,10 @@
+# 鍵(かぎ)や通知のあて先が入るファイル。GitHub には置かない。
+config.ini
+
+# 動かしたときにできる記録
+data/
+*.log
+
+# Python が自動で作るもの
+__pycache__/
+*.pyc

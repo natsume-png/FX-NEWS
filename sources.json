@@ -1,0 +1,65 @@
+{
+  "memo": "どこを見張るかの一覧。鍵(かぎ)や通知のあて先はここに書かない(config.ini に書く)。",
+  "context": "2026年11月19日時点のメモ。FRB(米国の中央銀行)の議長はウォーシュ氏。11月10日にウォラーFRB理事が、12月の会合で0.5%の利上げも検討しうると発言した。10月の米コア消費者物価は前月比0.3%の上昇。イングランド銀行(英国の中央銀行)は11月5日に政策金利を4%に引き上げた。ECB(ユーロ圏の中央銀行)の総裁はラガルド氏で、2027年2月7日に退任の予定。ドル円は159円台。11月12日に三村財務官が、為替介入の可能性を市場に意識させる発言をした。",
+  "feeds": [
+    {
+      "id": "fed_press",
+      "name": "FRB(米国の中央銀行)の発表",
+      "url": "https://www.federalreserve.gov/feeds/press_all.xml",
+      "kind": "official",
+      "interval_sec": 15
+    },
+    {
+      "id": "fed_speech",
+      "name": "FRB の講演・議会証言",
+      "url": "https://www.federalreserve.gov/feeds/speeches_and_testimony.xml",
+      "kind": "official",
+      "interval_sec": 15
+    },
+    {
+      "id": "ecb_press",
+      "name": "ECB(ユーロ圏の中央銀行)の発表・講演",
+      "url": "https://www.ecb.europa.eu/rss/press.html",
+      "kind": "official",
+      "interval_sec": 15
+    },
+    {
+      "id": "boe_news",
+      "name": "イングランド銀行(英国の中央銀行)の発表",
+      "url": "https://www.bankofengland.co.uk/rss/news",
+      "kind": "official",
+      "interval_sec": 15
+    },
+    {
+      "id": "boj_news",
+      "name": "日本銀行の新着情報",
+      "url": "https://www.boj.or.jp/rss/whatsnew.xml",
+      "kind": "official",
+      "interval_sec": 15
+    },
+    {
+      "id": "investinglive",
+      "name": "investingLive(為替ニュース)",
+      "url": "https://investinglive.com/feed",
+      "kind": "news",
+      "interval_sec": 30
+    },
+    {
+      "id": "trump_truth",
+      "name": "トランプ大統領の投稿(保存サイト経由)",
+      "url": "https://www.trumpstruth.org/feed",
+      "kind": "vip",
+      "interval_sec": 30
+    }
+  ],
+  "edgar": {
+    "memo": "決算などの届け出を見張る米国の会社(ティッカー)。8-K は、決算の発表などの重要な出来事を知らせる届け出の種類。",
+    "tickers": ["NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA"],
+    "forms": ["8-K"],
+    "interval_sec": 15
+  },
+  "x": {
+    "memo": "X で受け取る投稿の条件(ルール)。tag は通知に出す名前。value は X の書き方(例: from:アカウント名 -is:retweet)。X の登録がすんでから、実在を確かめたアカウントを書く。",
+    "rules": []
+  }
+}

@@ -1,0 +1,49 @@
+name: check
+
+# 送るたびに、Windows・Mac・Linux でテストを実行する。
+# コミットの説明に [live] と書いたときだけ、本物の情報源につないで点検する(通知は送らない)。
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit and end-to-end tests (no outside network needed)
+        run: python -m unittest discover -s tests -v
+      - name: Windows launcher (fx.bat)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call fx.bat report < NUL
+
+  live:
+    name: live check against the real sources
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[live]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check every source once
+        run: python run.py check
+      - name: Run for 60 seconds without sending notifications
+        if: always()
+        run: python run.py run --dry --replay 1 --seconds 60
