@@ -25,6 +25,7 @@ def run_check(cfg, sources, out=print):
     out("設定ファイル config.ini: %s" % ("読みこみました" if cfg.loaded else "まだありません(なくても点検はできます)"))
     out("")
 
+    daily_bytes = 0.0  # 24時間つづけて見張ったときの、1日の通信量の目安
     out("■ 更新一覧(ニュース・公式発表)")
     for spec in sources.get("feeds", []):
         if spec.get("enabled", True) is False:
@@ -34,13 +35,21 @@ def run_check(cfg, sources, out=print):
         try:
             entries = poller.fetch() or []
             took = time.time() - start
+            # もう一度たのんで、「前回から変わっていません(304)」という短い返事をもらえるかを見る
+            unchanged = poller.fetch() is None
+            per_day = 86400.0 / poller.interval
+            daily_bytes += per_day * (400 if unchanged else poller.last_wire)
+            size = "受け取り %dKB、変更なしの短い返事: %s" % (
+                max(1, poller.last_wire // 1000),
+                "あり" if unchanged else "なし(毎回ぜんぶ受け取る)",
+            )
             if entries:
                 newest = max(entries, key=lambda e: e["published"] or 0)
                 when = jst(newest["published"], "%m/%d %H:%M") if newest["published"] else "時刻なし"
-                out("  OK  %s: %d件(%.1f秒)" % (poller.name_ja, len(entries), took))
+                out("  OK  %s: %d件(%.1f秒、%s)" % (poller.name_ja, len(entries), took, size))
                 out("        いちばん新しいもの [%s] %s" % (when, newest["title"][:70]))
             else:
-                out("  OK? %s: つながりましたが、記事が0件でした(%.1f秒)" % (poller.name_ja, took))
+                out("  OK? %s: つながりましたが、記事が0件でした(%.1f秒、%s)" % (poller.name_ja, took, size))
         except Exception as exc:
             bad += 1
             out("  NG  %s: %s" % (poller.name_ja, exc))
@@ -52,6 +61,7 @@ def run_check(cfg, sources, out=print):
         resp = request(cfg.get("rates", "url"), timeout=10, headers={"Accept": "application/json"})
         mids, open_pairs = parse_ticker(resp.json())
         took = time.time() - start
+        daily_bytes += 86400.0 / max(0.5, cfg.getfloat("rates", "interval_sec")) * resp.wire_len
         missing = [PAIR_JA[p] for p in PAIRS if p not in mids]
         if missing:
             bad += 1
@@ -121,6 +131,7 @@ def run_check(cfg, sources, out=print):
             bad += 1
             out("  NG  %s" % exc)
     out("")
+    out("1日の通信量の目安(更新一覧と為替レートを24時間見張った場合): 約 %d MB" % round(daily_bytes / 1e6))
     out("点検おわり: つながらなかったもの %d件" % bad)
     store.close()
     return bad

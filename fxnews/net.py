@@ -40,13 +40,15 @@ class HttpError(Exception):
 
 
 class Response:
-    __slots__ = ("status", "headers", "body", "url")
+    __slots__ = ("status", "headers", "body", "url", "wire_len")
 
-    def __init__(self, status, headers, body, url):
+    def __init__(self, status, headers, body, url, wire_len=None):
         self.status = status
         self.headers = headers
         self.body = body
         self.url = url
+        # 回線を通ったときの大きさ(圧縮されていれば、圧縮されたままのバイト数)
+        self.wire_len = len(body) if wire_len is None else wire_len
 
     def text(self, encoding="utf-8"):
         return self.body.decode(encoding, errors="replace")
@@ -130,7 +132,7 @@ def request(url, method="GET", headers=None, data=None, timeout=15, max_bytes=80
             if len(body) > max_bytes:
                 raise NetError("返ってきたデータが大きすぎます(%d バイト超)" % max_bytes)
             hdrs = _lower_headers(resp.headers)
-            return Response(resp.status, hdrs, _decode_body(body, hdrs), resp.geturl())
+            return Response(resp.status, hdrs, _decode_body(body, hdrs), resp.geturl(), len(body))
     except urllib.error.HTTPError as exc:
         hdrs = _lower_headers(exc.headers)
         if exc.code == 304:

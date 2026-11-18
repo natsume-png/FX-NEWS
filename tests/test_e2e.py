@@ -255,6 +255,8 @@ class EndToEndTest(unittest.TestCase):
         text = "\n".join(lines)
         self.assertEqual(bad, 0, text)
         self.assertIn("OK  にせの更新一覧: 2件", text)
+        self.assertIn("変更なしの短い返事: なし(毎回ぜんぶ受け取る)", text)
+        self.assertRegex(text, r"1日の通信量の目安\(更新一覧と為替レートを24時間見張った場合\): 約 \d+ MB")
         self.assertIn("Old headline two", text)
         self.assertIn("OK  6つの組合せを取れました", text)
         self.assertIn("ドル円 159.28", text)
@@ -526,6 +528,16 @@ class PieceTest(unittest.TestCase):
         self.assertEqual([i.title for i in fresh], ["New one"])
         self.assertEqual(fresh[0].key, "f|n1")
         self.assertEqual(poller.poll_once(), [])
+        self.assertGreater(poller.last_wire, 100)
+
+    def test_feed_url_date_placeholder(self):
+        from fxnews.util import utc_day
+
+        poller = FeedPoller({"id": "p", "name": "n", "url": "https://x.invalid/feed?start_date={yesterday}"}, self.store, None, None)
+        self.assertEqual(poller.current_url(), "https://x.invalid/feed?start_date=" + utc_day(time.time() - 86400))
+        self.assertRegex(poller.current_url(), r"start_date=\d{4}-\d{2}-\d{2}$")
+        plain = FeedPoller({"id": "q", "name": "n", "url": "https://x.invalid/feed"}, self.store, None, None)
+        self.assertEqual(plain.current_url(), "https://x.invalid/feed")
 
 
 if __name__ == "__main__":

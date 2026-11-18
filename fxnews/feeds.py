@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 
 from .models import Item
 from .net import HttpError, NetError, request, retry_after_seconds
-from .util import parse_date, strip_html
+from .util import parse_date, strip_html, utc_day
 
 log = logging.getLogger("fxnews.feeds")
 
@@ -151,6 +151,8 @@ class FeedPoller(threading.Thread):
         self.etag = None
         self.last_modified = None
         self.last_count = 0
+        self.last_wire = 0
+        self.last_size = 0
 
     def fetch(self):
         """いまの一覧を取ってくる。前回から変わっていなければ None。"""
@@ -159,14 +161,25 @@ class FeedPoller(threading.Thread):
             headers["If-None-Match"] = self.etag
         if self.last_modified:
             headers["If-Modified-Since"] = self.last_modified
-        resp = request(self.url, headers=headers, timeout=15)
+        resp = request(self.current_url(), headers=headers, timeout=15)
         if resp.status == 304:
             return None
         entries = parse_feed(resp.body)
         self.etag = resp.headers.get("etag")
         self.last_modified = resp.headers.get("last-modified")
         self.last_count = len(entries)
+        self.last_wire = resp.wire_len
+        self.last_size = len(resp.body)
         return entries
+
+    def current_url(self):
+        """住所の中の {yesterday} を、きのうの日付(協定世界時)に置きかえる。
+
+        「この日より後の記事だけ」と指定できる一覧で、毎回の受け取りを小さくするために使う。
+        """
+        if "{yesterday}" not in self.url:
+            return self.url
+        return self.url.replace("{yesterday}", utc_day(time.time() - 86400))
 
     def to_item(self, entry):
         return Item(
