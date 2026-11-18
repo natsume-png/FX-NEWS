@@ -12,7 +12,7 @@ import time
 import xml.etree.ElementTree as ET
 
 from .models import Item
-from .net import HttpError, NetError, request, retry_after_seconds
+from .net import HttpError, NetError, Session, retry_after_seconds
 from .util import parse_date, strip_html, utc_day
 
 log = logging.getLogger("fxnews.feeds")
@@ -150,6 +150,7 @@ class FeedPoller(threading.Thread):
         self._replayed = False
         self.etag = None
         self.last_modified = None
+        self.session = Session()
         self.last_count = 0
         self.last_wire = 0
         self.last_size = 0
@@ -161,7 +162,7 @@ class FeedPoller(threading.Thread):
             headers["If-None-Match"] = self.etag
         if self.last_modified:
             headers["If-Modified-Since"] = self.last_modified
-        resp = request(self.current_url(), headers=headers, timeout=15)
+        resp = self.session.get(self.current_url(), headers=headers, timeout=15)
         if resp.status == 304:
             return None
         entries = parse_feed(resp.body)
@@ -226,7 +227,16 @@ class FeedPoller(threading.Thread):
         fresh.sort(key=lambda it: it.published or it.fetched)
         return fresh
 
+    def close(self):
+        self.session.close()
+
     def run(self):
+        try:
+            self._loop()
+        finally:
+            self.close()
+
+    def _loop(self):
         delay = random.uniform(0.0, min(3.0, self.interval))
         fails = 0
         while not self.stop_event.wait(delay):

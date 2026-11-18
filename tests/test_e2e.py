@@ -529,6 +529,36 @@ class PieceTest(unittest.TestCase):
         self.assertEqual(fresh[0].key, "f|n1")
         self.assertEqual(poller.poll_once(), [])
         self.assertGreater(poller.last_wire, 100)
+        self.assertGreaterEqual(poller.session.reused, 3)  # つないだままの接続を使い回している
+        poller.close()
+
+    def test_session_keeps_connection(self):
+        from fxnews.net import HttpError, Session
+
+        st = self.state
+        session = Session()
+        for _ in range(5):
+            resp = session.get(st.base() + "/ticker")
+            self.assertEqual(resp.status, 200)
+            self.assertIn("USD_JPY", resp.text())
+        self.assertEqual(len(set(st.ticker_ports)), 1)  # 5回とも同じ接続
+        self.assertEqual(session.reused, 4)
+        # 相手(にせのサーバー)が、返事のたびにだまって接続を切っても、つなぎ直して成功する
+        st.drop_ticker_after = 1
+        for _ in range(3):
+            self.assertEqual(session.get(st.base() + "/ticker").status, 200)
+        self.assertGreaterEqual(len(set(st.ticker_ports)), 3)
+        st.drop_ticker_after = 0
+        # こちらの接続がこわれていたときも、つなぎ直して成功する
+        self.assertEqual(session.get(st.base() + "/ticker").status, 200)
+        session._conn.sock.close()
+        self.assertEqual(session.get(st.base() + "/ticker").status, 200)
+        # エラーの番号は、ふつうの request() と同じ形で伝わる
+        with self.assertRaises(HttpError) as ctx:
+            session.get(st.base() + "/missing")
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertEqual(session.get(st.base() + "/ticker").status, 200)
+        session.close()
 
     def test_feed_url_date_placeholder(self):
         from fxnews.util import utc_day

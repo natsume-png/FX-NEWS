@@ -59,6 +59,9 @@ class FakeState:
             "AUD_JPY": 107.020,
         }
         self.market_status = "OPEN"
+        self.ticker_ports = []  # 為替レートを取りに来た接続の番号(同じ番号なら、つないだまま使い回している)
+        self.ticker_hits = 0
+        self.drop_ticker_after = 0  # 0 以外なら、その回数ごとに相手(にせのサーバー)から接続を切る
         # ntfy
         self.ntfy = []
         self.ntfy_status = 200
@@ -151,7 +154,7 @@ PRESS_HTML = """<html><head><style>p {color: red}</style></head><body>
 
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.0"
+    protocol_version = "HTTP/1.1"
     state = None
 
     def log_message(self, fmt, *args):
@@ -198,6 +201,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, _rss(st), "application/rss+xml", {"ETag": etag} if etag else None)
         elif path == "/ticker":
             with st.lock:
+                st.ticker_ports.append(self.client_address[1])
+                st.ticker_hits += 1
+                if st.drop_ticker_after and st.ticker_hits % st.drop_ticker_after == 0:
+                    self.close_connection = True
                 rows = [
                     {"symbol": s, "ask": "%.5f" % (p * 1.00002), "bid": "%.5f" % (p * 0.99998), "timestamp": iso_now(), "status": st.market_status}
                     for s, p in st.prices.items()
@@ -237,8 +244,10 @@ class Handler(BaseHTTPRequestHandler):
             if status != 200:
                 self._json(status, {"title": "Unauthorized"})
                 return
+            self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
             self.end_headers()
             try:
                 self.wfile.write(b"\r\n")

@@ -6,6 +6,7 @@ import json
 import socket
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 
@@ -146,6 +147,99 @@ def request(url, method="GET", headers=None, data=None, timeout=15, max_bytes=80
         raise
     except _NET_ERRORS as exc:
         raise NetError(_explain(exc)) from None
+
+
+def _uses_proxy(scheme, host):
+    """この相手へは、パソコンに設定された中継(プロキシ)を通るか。"""
+    try:
+        if not urllib.request.getproxies().get(scheme):
+            return False
+        return not urllib.request.proxy_bypass(host)
+    except Exception:
+        return True
+
+
+class Session:
+    """同じ相手に、つないだままくり返し問い合わせる係。
+
+    毎回つなぎ直す(暗号のあいさつをやり直す)より速く、通信量も少ない。相手のサーバーの負担もへる。
+    1つの係(スレッド)が1つずつ持つ。うまくいかないときは、ふつうの request() と同じ結果になる。
+    中継(プロキシ)を通る環境や、行き先が変わる(リダイレクト)相手では、ふつうの request() にまかせる。
+    """
+
+    _REDIRECTS = (301, 302, 303, 307, 308)
+
+    def __init__(self):
+        self._conn = None
+        self._key = None
+        self._plain = False  # True なら、つないだままにせず request() を使う
+        self.reused = 0  # つないだままの接続を使い回した回数(点検・テスト用)
+
+    def close(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._conn = None
+        self._key = None
+
+    def _connect(self, scheme, host, port, timeout):
+        if scheme == "https":
+            return http.client.HTTPSConnection(host, port, timeout=timeout, context=ssl.create_default_context())
+        return http.client.HTTPConnection(host, port, timeout=timeout)
+
+    def get(self, url, headers=None, timeout=15, max_bytes=8000000):
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        host = parts.hostname or ""
+        if self._plain or scheme not in ("http", "https") or not host or _uses_proxy(scheme, host):
+            return request(url, headers=headers, timeout=timeout, max_bytes=max_bytes)
+        port = parts.port or (443 if scheme == "https" else 80)
+        key = (scheme, host, port)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        hdrs = {"User-Agent": USER_AGENT, "Accept-Encoding": "gzip", "Accept": "*/*"}
+        if headers:
+            hdrs.update(headers)
+        for attempt in (0, 1):
+            fresh = self._conn is None or self._key != key
+            if fresh:
+                self.close()
+                self._conn = self._connect(scheme, host, port, timeout)
+                self._key = key
+            conn = self._conn
+            try:
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                conn.request("GET", path, headers=hdrs)
+                resp = conn.getresponse()
+                body = resp.read(max_bytes + 1)
+                status = resp.status
+                rhdrs = {k.lower(): v for k, v in resp.getheaders()}
+                if resp.will_close or len(body) > max_bytes:
+                    self.close()
+                elif not fresh:
+                    self.reused += 1
+            except _NET_ERRORS as exc:
+                self.close()
+                if attempt == 0 and not fresh:
+                    continue  # 相手が、しばらく使っていない接続を切っていた。つなぎ直して、もう一度
+                raise NetError(_explain(exc)) from None
+            if len(body) > max_bytes:
+                raise NetError("返ってきたデータが大きすぎます(%d バイト超)" % max_bytes)
+            if status in self._REDIRECTS:
+                self._plain = True
+                self.close()
+                return request(url, headers=headers, timeout=timeout, max_bytes=max_bytes)
+            if status == 304:
+                return Response(304, rhdrs, b"", url)
+            decoded = _decode_body(body, rhdrs)
+            if status >= 400:
+                raise HttpError(status, decoded[:200000], rhdrs, url)
+            return Response(status, rhdrs, decoded, url, len(body))
+        raise NetError("つながりませんでした")
 
 
 def open_stream(url, headers=None, timeout=45):

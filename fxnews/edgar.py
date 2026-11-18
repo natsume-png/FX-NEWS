@@ -15,7 +15,7 @@ from urllib.parse import urljoin
 
 from .feeds import FeedError, parse_feed
 from .models import Item
-from .net import HttpError, NetError, request, retry_after_seconds
+from .net import HttpError, NetError, Session, retry_after_seconds
 from .util import strip_html
 
 log = logging.getLogger("fxnews.edgar")
@@ -94,6 +94,7 @@ class EdgarPoller(threading.Thread):
         self.health = health
         self.max_age = max_age_sec
         self.ciks = {}  # CIK番号 -> (ティッカー, 会社名)
+        self.session = Session()
         self.last_count = 0
 
     def headers(self):
@@ -110,7 +111,7 @@ class EdgarPoller(threading.Thread):
             except (ValueError, OSError):
                 cached = {}
         if not all(t in cached for t in self.tickers):
-            resp = request(self.base + TICKERS_PATH, headers=self.headers(), timeout=30, max_bytes=20000000)
+            resp = self.session.get(self.base + TICKERS_PATH, headers=self.headers(), timeout=30, max_bytes=20000000)
             table = parse_tickers(resp.json())
             cached = {t: list(table[t]) for t in self.tickers if t in table}
             missing = [t for t in self.tickers if t not in table]
@@ -125,17 +126,17 @@ class EdgarPoller(threading.Thread):
         return self.ciks
 
     def fetch_form(self, form):
-        resp = request(self.base + ATOM_PATH.format(form=form), headers=self.headers(), timeout=20)
+        resp = self.session.get(self.base + ATOM_PATH.format(form=form), headers=self.headers(), timeout=20)
         return parse_feed(resp.body)
 
     def fetch_press_release(self, index_url):
         """決算の届け出なら、添付の発表文の冒頭を取ってくる(できなければ空文字)。"""
         try:
-            page = request(index_url, headers=self.headers(), timeout=15)
+            page = self.session.get(index_url, headers=self.headers(), timeout=15)
             url = find_press_release_url(page.text(), index_url)
             if not url:
                 return ""
-            doc = request(url, headers=self.headers(), timeout=20)
+            doc = self.session.get(url, headers=self.headers(), timeout=20)
             return strip_html(doc.text(), 6000)
         except (NetError, HttpError) as exc:
             log.info("発表文を取れませんでした: %s", exc)
@@ -199,7 +200,16 @@ class EdgarPoller(threading.Thread):
         self.last_count = total
         return fresh
 
+    def close(self):
+        self.session.close()
+
     def run(self):
+        try:
+            self._loop()
+        finally:
+            self.close()
+
+    def _loop(self):
         delay = random.uniform(0.0, 3.0)
         fails = 0
         while not self.stop_event.wait(delay):

@@ -28,14 +28,14 @@
       "name": "イングランド銀行(英国の中央銀行)の発表",
       "url": "https://www.bankofengland.co.uk/rss/news",
       "kind": "official",
-      "interval_sec": 15
+      "interval_sec": 30
     },
     {
       "id": "boj_news",
       "name": "日本銀行の新着情報",
       "url": "https://www.boj.or.jp/rss/whatsnew.xml",
       "kind": "official",
-      "interval_sec": 15
+      "interval_sec": 60
     },
     {
       "id": "investinglive",

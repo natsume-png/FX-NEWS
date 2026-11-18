@@ -155,6 +155,7 @@ class EdgarTest(unittest.TestCase):
         self.poller.ciks = {1045810: ("NVDA", "NVIDIA CORP")}
 
     def tearDown(self):
+        self.poller.close()
         self.store.close()
         self.tmp.cleanup()
 

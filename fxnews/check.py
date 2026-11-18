@@ -15,6 +15,9 @@ from .util import jst, mask_secret
 from .xstream import XStream
 
 
+HEADER_BYTES = 500  # 1回のやりとりにつく、中身以外の部分(見出し)のおおよその大きさ
+
+
 def run_check(cfg, sources, out=print):
     """戻り値は、つながらなかった情報源の数。"""
     bad = 0
@@ -38,7 +41,7 @@ def run_check(cfg, sources, out=print):
             # もう一度たのんで、「前回から変わっていません(304)」という短い返事をもらえるかを見る
             unchanged = poller.fetch() is None
             per_day = 86400.0 / poller.interval
-            daily_bytes += per_day * (400 if unchanged else poller.last_wire)
+            daily_bytes += per_day * (HEADER_BYTES + (0 if unchanged else poller.last_wire))
             size = "受け取り %dKB、変更なしの短い返事: %s" % (
                 max(1, poller.last_wire // 1000),
                 "あり" if unchanged else "なし(毎回ぜんぶ受け取る)",
@@ -53,6 +56,8 @@ def run_check(cfg, sources, out=print):
         except Exception as exc:
             bad += 1
             out("  NG  %s: %s" % (poller.name_ja, exc))
+        finally:
+            poller.close()
     out("")
 
     out("■ 為替レート(GMOコイン)")
@@ -61,7 +66,7 @@ def run_check(cfg, sources, out=print):
         resp = request(cfg.get("rates", "url"), timeout=10, headers={"Accept": "application/json"})
         mids, open_pairs = parse_ticker(resp.json())
         took = time.time() - start
-        daily_bytes += 86400.0 / max(0.5, cfg.getfloat("rates", "interval_sec")) * resp.wire_len
+        daily_bytes += 86400.0 / max(0.5, cfg.getfloat("rates", "interval_sec")) * (HEADER_BYTES + resp.wire_len)
         missing = [PAIR_JA[p] for p in PAIRS if p not in mids]
         if missing:
             bad += 1
@@ -97,6 +102,8 @@ def run_check(cfg, sources, out=print):
         except Exception as exc:
             bad += 1
             out("  NG  %s" % exc)
+        finally:
+            poller.close()
     out("")
 
     out("■ 解説(Claude)")

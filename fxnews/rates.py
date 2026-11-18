@@ -10,7 +10,7 @@ import threading
 import time
 
 from .models import Item
-from .net import HttpError, NetError, request
+from .net import HttpError, NetError, Session
 
 log = logging.getLogger("fxnews.rates")
 
@@ -308,9 +308,14 @@ class RatesPoller(threading.Thread):
         self.health = health
         self.open_pairs = set()
         self.last_ok = 0.0
+        self.last_wire = 0
+        self.polls = 0  # レートを取りに行った回数
+        self.session = Session()
 
     def poll_once(self):
-        resp = request(self.url, timeout=8, headers={"Accept": "application/json"})
+        resp = self.session.get(self.url, timeout=8, headers={"Accept": "application/json"})
+        self.last_wire = resp.wire_len
+        self.polls += 1
         mids, open_pairs = parse_ticker(resp.json())
         if not mids:
             raise ValueError("レートが1つも入っていません")
@@ -329,7 +334,16 @@ class RatesPoller(threading.Thread):
             return {}
         return dict(mids)
 
+    def close(self):
+        self.session.close()
+
     def run(self):
+        try:
+            self._loop()
+        finally:
+            self.close()
+
+    def _loop(self):
         delay = 0.0
         fails = 0
         while not self.stop_event.wait(delay):

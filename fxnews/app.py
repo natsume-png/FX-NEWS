@@ -418,6 +418,11 @@ class App:
             self.drain(8.0)
             self.stop.set()
             log.info("[おわり] %s", self.summary_line())
+            log.info(
+                "[接続] 為替レートを取った回数 %d(うち、つないだままの接続を使い回した回数 %d)",
+                self.rates.polls,
+                self.rates.session.reused,
+            )
 
     def drain(self, timeout):
         """受け取りずみの情報を、処理しおわるまで少し待つ。"""
