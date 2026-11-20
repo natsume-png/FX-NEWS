@@ -487,6 +487,25 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(Config(self.home).get("claude", "api_key"), "")
 
+    def test_commands_leave_a_record_without_secrets(self):
+        self.config(service="pushover", x_token="", contact="")
+        (self.home / "sources.json").write_text(json.dumps(make_sources(self.state), ensure_ascii=False), encoding="utf-8")
+        code, out = call(self.run.main, ["check"])
+        self.assertEqual(code, 0, out)
+        saved = (self.home / "data" / "check_last.txt").read_text(encoding="utf-8")
+        self.assertIn("■ 通知(Pushover)", saved)
+        self.assertIn("点検おわり: つながらなかったもの 0件", saved)
+        self.assertEqual(saved.strip(), out.strip())
+        call(self.run.main, ["version"])
+        call(self.run.main, ["test-notify"])
+        record = (self.home / "data" / "commands.log").read_text(encoding="utf-8")
+        self.assertRegex(record, r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d check: 終わりの番号 0")
+        self.assertIn("version: 終わりの番号 0", record)
+        self.assertIn("test-notify: 終わりの番号 0", record)
+        for secret in (PO_TOKEN, PO_USER, "sk-test-key"):
+            self.assertNotIn(secret, saved)
+            self.assertNotIn(secret, record)
+
     def test_setup_sec(self):
         cfg = self.config(contact="")
         code, out = call(self.run.cmd_setup_sec, cfg, answers("山田", "Taro Yamada", "not-a-mail", "taro@example.com"))
@@ -529,6 +548,11 @@ class CommandTest(unittest.TestCase):
         code, out = call(self.run.main, ["status"])
         self.assertEqual(code, 1)
         self.assertIn("・止まっています", out)
+        record = (self.home / "data" / "commands.log").read_text(encoding="utf-8")
+        self.assertIn("run: 始めます", record)
+        self.assertIn("run: 終わりの番号 3", record)
+        self.assertIn("run: 終わりの番号 0", record)
+        self.assertIn("stop: 終わりの番号 0", record)
 
 
 if __name__ == "__main__":

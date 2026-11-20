@@ -93,19 +93,34 @@ def say(text=""):
 
 
 def place_console(cfg, cmd):
-    """config.ini に黒い画面の置き場所が書いてあれば、そこへ動かす(Windows だけ)。"""
+    """config.ini に黒い画面の置き場所が書いてあれば、そこへ動かす(Windows だけ)。どうなったかの説明を返す。"""
     text = cfg.get("general", "console_rect")
     if not text or os.name != "nt" or sys.stdout is None:
-        return
+        return ""
     from fxnews.winconsole import parse_rect, place
 
     rect = parse_rect(text)
     if rect is None:
-        say("(config.ini の [general] console_rect の書き方がちがいます。「左,上,幅,高さ」の数字4つで書きます)")
-        return
+        note = "config.ini の [general] console_rect の書き方がちがいます。「左,上,幅,高さ」の数字4つで書きます"
+        say("(%s)" % note)
+        return note
     ok, note = place(rect, title="FX-NEWS %s" % cmd)
     if not ok:
         say("(%s)" % note)
+    return note
+
+
+def note_command(cfg, text):
+    """コマンドを動かした記録を、data/commands.log に1行足す(鍵や番号は書かない)。
+
+    黒い画面を閉じたあとでも、いつ・何を動かして・どうなったかを見返せるようにするため。
+    """
+    try:
+        cfg.data_dir.mkdir(parents=True, exist_ok=True)
+        with open(str(cfg.data_dir / "commands.log"), "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (jst(None, "%Y-%m-%d %H:%M:%S"), text))
+    except OSError:
+        pass
 
 
 def clear_screen():
@@ -400,8 +415,19 @@ def main(argv=None):
     home = home_dir()
     cfg = Config(home)
     setup_output(cfg.data_dir, to_file=(cmd == "run"))
-    place_console(cfg, cmd)
+    placed = place_console(cfg, cmd)
+    if cmd == "run":
+        note_command(cfg, "run: 始めます%s" % ("(黒い画面なし)" if sys.stdout is None else ""))
+    code = None
+    try:
+        code = dispatch(args, cmd, home, cfg)
+        return code
+    finally:
+        note_command(cfg, "%s: 終わりの番号 %s%s" % (cmd, "?" if code is None else code, "｜" + placed if placed else ""))
 
+
+def dispatch(args, cmd, home, cfg):
+    """コマンドを1つ動かして、終わりの番号(0 がふつうの終わり)を返す。"""
     if cmd == "version":
         say("FX見張り番 %s" % __version__)
         return 0
@@ -424,7 +450,19 @@ def main(argv=None):
     if cmd == "check":
         from fxnews.check import run_check
 
-        return 1 if run_check(cfg, sources) else 0
+        lines = []
+
+        def out(text=""):
+            say(text)
+            lines.append(text)
+
+        bad = run_check(cfg, sources, out=out)
+        try:  # 点検の結果を、あとから見返せるように残す(鍵は、はじめから伏せ字で出している)
+            cfg.data_dir.mkdir(parents=True, exist_ok=True)
+            (cfg.data_dir / "check_last.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        return 1 if bad else 0
     if cmd == "report":
         from fxnews.report import run_report
         from fxnews.store import Store
