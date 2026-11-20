@@ -372,17 +372,28 @@ class App:
             pass
 
     def stop_requested(self):
-        """止めてほしいという合図(data/stop.request)が来ていたら、合図を片づけて True。"""
+        """止めてほしいという合図(data/stop.request)が来ていたら、合図を片づけて True。
+
+        合図のファイルは、この見張りを始めたあとに置かれたものだけを、合図としてあつかう。
+        前の回の合図が消せずに残っていても(Windows では、ウイルス対策のソフトなどがファイルを
+        つかんでいて、すぐに消せないことがある)、それで止まってしまわないようにするため。
+        """
         if self.dry:
             return False  # お試しモードは、本番あての合図を横取りしない
         path = self.cfg.data_dir / STOP_FILE
         try:
-            if path.exists():
-                path.unlink()
-                return True
+            placed = path.stat().st_mtime
         except OSError:
-            return True
-        return False
+            return False  # 合図はない
+        for _ in range(5):
+            try:
+                path.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                time.sleep(0.2)  # だれかがファイルをつかんでいる。少し待って、もう一度
+        return placed >= self.started - 1.0
 
     # ---- 起動と終了 ----
     def build_threads(self):

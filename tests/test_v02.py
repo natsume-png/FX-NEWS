@@ -389,11 +389,27 @@ class PushoverPipelineTest(unittest.TestCase):
         alive = json.loads(alive_path.read_text(encoding="utf-8"))
         self.assertEqual((alive["state"], alive["service"], alive["version"]), ("running", "pushover", "0.2.0"))
         # 止めてほしいという合図のファイルを置くと、止まる
-        (Path(self.tmp.name) / "data" / STOP_FILE).write_text("stop", encoding="utf-8")
+        stop_path = Path(self.tmp.name) / "data" / STOP_FILE
+        stop_path.write_text("stop", encoding="utf-8")
         runner.join(timeout=20)
         self.assertFalse(runner.is_alive(), "合図を置いても止まらない")
-        self.assertFalse((Path(self.tmp.name) / "data" / STOP_FILE).exists())
         self.assertEqual(json.loads(alive_path.read_text(encoding="utf-8"))["state"], "stopped")
+        self.app.close()
+
+        # 前の回の合図が消せずに残っていても、次に始めたときに、それで止まってしまわない
+        stop_path.write_text("old", encoding="utf-8")
+        long_ago = time.time() - 3600
+        os.utime(str(stop_path), (long_ago, long_ago))
+        self.app = App(cfg, make_sources(self.state))
+        runner = threading.Thread(target=self.app.run, daemon=True)
+        runner.start()
+        self.assertTrue(wait_for(lambda: len(self.find("FX見張り番を始めました")) >= 2))
+        time.sleep(1.5)
+        self.assertTrue(runner.is_alive(), "古い合図で止まってしまった")
+        self.assertTrue(wait_for(lambda: not stop_path.exists()), "古い合図が片づいていない")
+        stop_path.write_text("stop", encoding="utf-8")
+        runner.join(timeout=20)
+        self.assertFalse(runner.is_alive(), "新しい合図を置いても止まらない")
 
 
 class CommandTest(unittest.TestCase):
