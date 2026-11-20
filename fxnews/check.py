@@ -119,12 +119,37 @@ def run_check(cfg, sources, out=print):
         out("  %s  鍵: %s / %s" % ("OK" if ok else "NG", mask_secret(analyzer.key), note))
     out("")
 
-    out("■ 通知(ntfy)")
     notifier = Notifier(cfg, store)
-    if notifier.available():
-        out("  OK  あて先: 設定あり。ためしに1通送るには、test-notify を実行します")
+    out("■ 通知(%s)" % notifier.name_ja)
+    if notifier.bad_service:
+        out("  NG? config.ini の [notify] service の「%s」は知らない名前です。ntfy としてあつかいます" % notifier.bad_service)
+    if not notifier.available():
+        if notifier.service == "pushover":
+            out("  --  止めています。Pushover の番号がまだありません。setup-pushover を実行すると入れられます")
+        else:
+            out("  --  止めています。あて先(topic)がまだありません。topic を実行すると作れます")
+    elif notifier.service == "pushover":
+        try:
+            limits = notifier.pushover_get("/1/apps/limits.json")
+            out("  OK  番号: 受け取り %s / 送り主 %s" % (mask_secret(notifier.po_user), mask_secret(notifier.po_token)))
+            out("        Pushover のアカウントぜんぶの、今月の送れる数: 残り %s通 / %s通(%s 日本時間に元にもどる)" % (
+                limits.get("remaining", "?"), limits.get("limit", "?"),
+                jst(float(limits["reset"]), "%m/%d %H:%M") if limits.get("reset") else "?"))
+            out("        このプログラムの上限: 1日 %d通・1か月 %d通。アカウントの残りが %d通を切ったら、ニュースの通知を止めます" % (
+                notifier.daily_limit, notifier.monthly_limit, notifier.reserve))
+            known = notifier.pushover_get("/1/sounds.json").get("sounds") or {}
+            unknown = sorted({name for name in notifier.po_sounds.values() if name and name not in known})
+            if unknown and known:
+                out("  NG? Pushover の音の一覧にない名前が、設定に書かれています: %s" % "、".join(unknown))
+            else:
+                out("        音: ニュース %s / 重要なニュース %s / 急騰急落 %s / プログラムからのお知らせ %s" % (
+                    notifier.po_sounds["news"], notifier.po_sounds["important"], notifier.po_sounds["spike"], notifier.po_sounds["system"]))
+            out("        ためしに1通送るには、test-notify を実行します")
+        except Exception as exc:
+            bad += 1
+            out("  NG  %s" % exc)
     else:
-        out("  --  止めています。あて先(topic)がまだありません。topic を実行すると作れます")
+        out("  OK  あて先: 設定あり。ためしに1通送るには、test-notify を実行します")
     out("")
 
     out("■ X")

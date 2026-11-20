@@ -106,6 +106,22 @@ def cut_bytes(text, max_bytes):
     return cut.decode("utf-8", errors="ignore").rstrip() + "…"
 
 
+def cut_chars(text, max_chars):
+    """max_chars 文字を超えないように短くする(Pushover は、バイト数ではなく文字数で数える)。"""
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def next_utc_month_start(ts=None):
+    """次の月の1日 0時(協定世界時)の UNIX 秒。"""
+    if ts is None:
+        ts = time.time()
+    d = dt.datetime.fromtimestamp(ts, UTC)
+    year, month = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+    return dt.datetime(year, month, 1, tzinfo=UTC).timestamp()
+
+
 def short_hash(text):
     return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 

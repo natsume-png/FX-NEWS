@@ -15,14 +15,16 @@ from .edgar import EdgarPoller
 from .feeds import FeedPoller
 from .models import KIND_JA
 from .notifier import Notifier, build_news_notification, build_spike_notification, news_tags, tag_line
-from .rates import RateBook, RatesPoller, SpikeDetector, currency_strength
+from .rates import RateBook, RatesPoller, SpikeDetector, currency_strength, spike_title
 from .store import Store
-from .util import jst, normalize_for_dedupe, short_hash, utc_month
+from .util import jst, normalize_for_dedupe, short_hash, utc_day, utc_month
 from .xstream import XStream
 
 log = logging.getLogger("fxnews.app")
 
 RAW_NOTIFY_KINDS = ("official", "edgar")  # Claude が使えないときでも、見出しのまま知らせる種類
+STOP_FILE = "stop.request"  # data フォルダにこの名前のファイルができたら、見張りを止める(stop コマンドが作る)
+ALIVE_FILE = "alive.json"  # 動いているあいだ、30秒ごとに書きなおす「元気です」のしるし(status コマンドが読む)
 
 
 class Health:
@@ -95,8 +97,8 @@ class App:
         self.queue = queue.Queue()
         self.analyzer = Analyzer(cfg, self.store, context=sources.get("context", ""))
         self.notifier = Notifier(cfg, self.store)
-        self.min_importance = cfg.getint("ntfy", "min_importance")
-        self.spike_fast = cfg.getbool("ntfy", "spike_fast")
+        self.min_importance = cfg.getint("notify", "min_importance")
+        self.spike_fast = cfg.getbool("notify", "spike_fast")
         self.health = Health(self.system_alert)
         self.book = RateBook(keep_sec=1200)
         self.detector = SpikeDetector(
@@ -135,18 +137,29 @@ class App:
             self.counts[key] = self.counts.get(key, 0) + 1
 
     # ---- 通知 ----
-    def _send(self, title, body, priority, click=None, seq=None):
+    def _send(self, title, body, priority, click=None, seq=None, kind="news", followup=False):
         if self.dry:
             return True, "(お試しモード: 送っていません)"
         if not self.notifier.available():
-            return False, "通知のあて先が未設定"
-        return self.notifier.send(title, body, priority, click=click, sequence_id=seq)
+            return False, self.notifier.missing()
+        ok, why = self.notifier.send(title, body, priority, click=click, sequence_id=seq, kind=kind, followup=followup)
+        if not ok and self.notifier.limit_reason:
+            self._alert_limit(self.notifier.limit_reason)
+        return ok, why
+
+    def _alert_limit(self, reason):
+        """通知の上限で送れなかったことを、1日に1回だけ知らせる。"""
+        key = "notify|%s|%s" % (utc_day(), reason[:10])
+        if key in self._alerted_budget:
+            return
+        self._alerted_budget.add(key)
+        self.system_alert("%s。ニュースと急騰急落の通知を止めています(上限の数は config.ini で変えられます)" % reason)
 
     def system_alert(self, message):
         """プログラムそのものについてのお知らせ(つながらない、上限に届いた、など)。"""
         log.warning("[お知らせ] %s", message)
         if not self.dry and self.notifier.available():
-            self.notifier.send("FX見張り番からのお知らせ", message, priority=3)
+            self.notifier.send("FX見張り番からのお知らせ", message, priority=3, kind="system")
 
     # ---- ニュース ----
     def _raw_result(self, item, why):
@@ -232,14 +245,21 @@ class App:
         sent = False
         if self.spike_fast:
             title, body, priority = build_spike_notification(sp, "", recent)
-            sent, note = self._send(title, body, priority, seq=seq)
+            sent, note = self._send(title, body, priority, seq=seq, kind="spike")
             log.info("[急騰急落] %s %s", title, note)
         cause, why = self.analyzer.explain_spike(sp, recent)
         if cause or not self.spike_fast:
-            title, body, priority = build_spike_notification(sp, cause, recent)
-            ok, note = self._send(title, body, priority, seq=seq)
-            sent = sent or ok
-            log.info("[急騰急落・原因つき] %s %s", cause or "(原因の説明なし: %s)" % why, note)
+            second = sent and not self.notifier.can_replace and not self.dry  # 差しかえられないので、2通目になる
+            if second and "見当たりません" in cause:
+                # 手がかりがないと分かっただけなら、2通目は送らない(送れる数を大事にする)
+                log.info("[急騰急落・原因つき] %s(2通目は送りません)", cause)
+            else:
+                title, body, priority = build_spike_notification(sp, cause, recent)
+                if second:
+                    title = "原因の見立て｜%s" % spike_title(sp)
+                ok, note = self._send(title, body, priority, seq=seq, kind="spike", followup=sent)
+                sent = sent or ok
+                log.info("[急騰急落・原因つき] %s %s", cause or "(原因の説明なし: %s)" % why, note)
         self.store.set_notified(row_id, sent, time.time() - item.fetched)
         if sent:
             self._bump("notified")
@@ -312,15 +332,57 @@ class App:
             "FX見張り番は動いています",
             "この24時間の通知: %d件\n%s" % (n, self.summary_line()),
             priority=2,
+            kind="system",
         )
         return ok
 
     def _housekeeping_loop(self):
         while not self.stop.wait(30.0):
             try:
+                self.write_alive("running")
                 self.housekeeping_tick(time.time())
             except Exception:
                 log.exception("定期の仕事で思わぬエラー")
+
+    # ---- 動いているしるしと、止めてほしいという合図 ----
+    def write_alive(self, state):
+        """「元気です」のしるしを data/alive.json に書く(status コマンドや、外からの点検で読む)。"""
+        if self.dry or self.store.path == ":memory:":
+            return  # お試しモードは、本番のしるしを書きかえない
+        now = time.time()
+        info = {
+            "ts": now,
+            "jst": jst(now, "%Y-%m-%d %H:%M:%S"),
+            "state": state,
+            "pid": os.getpid(),
+            "version": __version__,
+            "started": jst(self.started, "%Y-%m-%d %H:%M:%S"),
+            "service": self.notifier.service,
+            "dry": self.dry,
+            "summary": self.summary_line(),
+            "failing": self.health.failing(),
+        }
+        path = self.cfg.data_dir / ALIVE_FILE
+        tmp = self.cfg.data_dir / (ALIVE_FILE + ".tmp")
+        try:
+            self.cfg.data_dir.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(str(tmp), str(path))
+        except OSError:
+            pass
+
+    def stop_requested(self):
+        """止めてほしいという合図(data/stop.request)が来ていたら、合図を片づけて True。"""
+        if self.dry:
+            return False  # お試しモードは、本番あての合図を横取りしない
+        path = self.cfg.data_dir / STOP_FILE
+        try:
+            if path.exists():
+                path.unlink()
+                return True
+        except OSError:
+            return True
+        return False
 
     # ---- 起動と終了 ----
     def build_threads(self):
@@ -385,9 +447,11 @@ class App:
         if self.dry:
             lines.append("・通知: お試しモード(スマホには送らず、この画面に出すだけ)")
         elif self.notifier.available():
-            lines.append("・通知(ntfy): 重要度 %d 以上を送ります(きょう %d通 / 上限 %d通)" % (self.min_importance, self.notifier.sent_today(), self.notifier.daily_limit))
+            lines.append("・通知(%s): 重要度 %d 以上を送ります(%s)" % (self.notifier.name_ja, self.min_importance, self.notifier.limits_text()))
         else:
-            lines.append("・通知(ntfy): 止めています(あて先が未設定)。この画面に出すだけです")
+            lines.append("・通知(%s): 止めています(%s)。この画面に出すだけです" % (self.notifier.name_ja, self.notifier.missing()))
+        if self.notifier.bad_service:
+            lines.append("・[notify] service の「%s」は知らない名前なので、ntfy としてあつかいます(ntfy か pushover と書きます)" % self.notifier.bad_service)
         return lines
 
     def start(self):
@@ -402,14 +466,19 @@ class App:
         if self.cfg.getbool("general", "sleep_block") and seconds is None:
             if block_sleep():
                 log.info("・このプログラムが動いているあいだ、パソコンが自動でスリープしないようにしています(config.ini の sleep_block = no で止められます)")
+        self.stop_requested()  # 前の回の合図が残っていたら、片づける
         self.start()
+        self.write_alive("running")
         if not self.dry and self.notifier.available() and seconds is None:
-            self.notifier.send("FX見張り番を始めました", "\n".join(self.describe()[1:]), priority=2)
-        log.info("止めるときは、この画面で Ctrl キーを押しながら C を押します")
+            self.notifier.send("FX見張り番を始めました", "\n".join(self.describe()[1:]), priority=2, kind="system")
+        log.info("止めるときは、この画面で Ctrl キーを押しながら C を押すか、stop を実行します")
         end = time.time() + seconds if seconds else None
         try:
             while not self.stop.is_set():
                 if end and time.time() >= end:
+                    break
+                if self.stop_requested():
+                    log.info("止めるように頼まれたので、止めます…")
                     break
                 time.sleep(0.5)
         except KeyboardInterrupt:
@@ -417,6 +486,7 @@ class App:
         finally:
             self.drain(8.0)
             self.stop.set()
+            self.write_alive("stopped")
             log.info("[おわり] %s", self.summary_line())
             log.info(
                 "[接続] 為替レートを取った回数 %d(うち、つないだままの接続を使い回した回数 %d)",

@@ -461,14 +461,28 @@ class ConfigTest(unittest.TestCase):
             cfg = config.Config(tmp)
             self.assertFalse(cfg.loaded)
             self.assertEqual(cfg.get("claude", "model"), "claude-haiku-5-5")
-            self.assertEqual(cfg.getint("ntfy", "min_importance"), 3)
+            self.assertEqual(cfg.getint("notify", "min_importance"), 3)
+            self.assertEqual(cfg.get("notify", "service"), "ntfy")
             self.assertTrue(cfg.getbool("general", "sleep_block"))
-            (Path(tmp) / "config.ini").write_bytes("﻿# 説明\n[claude]\napi_key = sk-%test#1\n[ntfy]\nmin_importance = 4\n".encode("utf-8"))
+            (Path(tmp) / "config.ini").write_bytes("\ufeff# 説明\n[claude]\napi_key = sk-%test#1\n[notify]\nmin_importance = 4\n".encode("utf-8"))
             cfg = config.Config(tmp)
             self.assertTrue(cfg.loaded)
             self.assertEqual(cfg.get("claude", "api_key"), "sk-%test#1")
-            self.assertEqual(cfg.getint("ntfy", "min_importance"), 4)
+            self.assertEqual(cfg.getint("notify", "min_importance"), 4)
             self.assertEqual(cfg.getfloat("rates", "threshold_5m"), 0.15)
+
+    def test_old_place_of_notify_settings_is_still_read(self):
+        """前の版(v0.1)で [ntfy] に書いていた項目は、いまも読む。[notify] に書いてあれば、そちらが勝つ。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.ini"
+            path.write_text("[ntfy]\nmin_importance = 5\nspike_fast = no\n", encoding="utf-8")
+            cfg = config.Config(tmp)
+            self.assertEqual(cfg.getint("notify", "min_importance"), 5)
+            self.assertFalse(cfg.getbool("notify", "spike_fast"))
+            path.write_text("[ntfy]\nmin_importance = 5\n[notify]\nmin_importance = 2\n", encoding="utf-8")
+            cfg = config.Config(tmp)
+            self.assertEqual(cfg.getint("notify", "min_importance"), 2)
+            self.assertTrue(cfg.getbool("notify", "spike_fast"))
 
     def test_env_override(self):
         with tempfile.TemporaryDirectory() as tmp:

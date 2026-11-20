@@ -25,13 +25,29 @@ DEFAULTS = {
         "price_in_usd_per_mtok": "0.10",
         "price_out_usd_per_mtok": "0.50",
     },
+    "notify": {
+        "service": "ntfy",
+        "min_importance": "3",
+        "spike_fast": "yes",
+    },
     "ntfy": {
         "server": "https://ntfy.sh",
         "topic": "",
         "access_token": "",
-        "min_importance": "3",
         "daily_limit": "240",
-        "spike_fast": "yes",
+    },
+    "pushover": {
+        "user_key": "",
+        "api_token": "",
+        "device": "",
+        "sound_news": "incoming",
+        "sound_important": "bugle",
+        "sound_spike": "spacealarm",
+        "sound_system": "mechanical",
+        "daily_limit": "200",
+        "monthly_limit": "5000",
+        "reserve": "1500",
+        "api_base": "https://api.pushover.net",
     },
     "x": {
         "bearer_token": "",
@@ -58,7 +74,14 @@ DEFAULTS = {
         "heartbeat_hour": "8",
         "max_item_age_hours": "6",
         "workers": "3",
+        "console_rect": "",
     },
+}
+
+# 前の版(v0.1)では [ntfy] に書いていた項目。古い config.ini に書いてあれば、そちらも読む。
+LEGACY = {
+    ("notify", "min_importance"): ("ntfy", "min_importance"),
+    ("notify", "spike_fast"): ("ntfy", "spike_fast"),
 }
 
 _TRUE = ("1", "yes", "true", "on", "はい")
@@ -71,8 +94,7 @@ class Config:
         self.base_dir = Path(base_dir)
         self.path = Path(path) if path else self.base_dir / "config.ini"
         self.data_dir = self.base_dir / "data"
-        self._cp = configparser.ConfigParser(interpolation=None)
-        self._cp.read_dict(DEFAULTS)
+        self._cp = configparser.ConfigParser(interpolation=None)  # config.ini に書いてあるものだけ
         self.loaded = False
         if self.path.exists():
             self._read()
@@ -91,11 +113,22 @@ class Config:
         self._cp.read_string(text)
         self.loaded = True
 
-    def get(self, section, key):
+    def _explicit(self, section, key):
+        """環境変数か config.ini に書いてあれば、その値。書いてなければ None。"""
         env = os.environ.get("FXNEWS_%s_%s" % (section.upper(), key.upper()))
         if env is not None:
             return env.strip()
-        return self._cp.get(section, key, fallback=DEFAULTS.get(section, {}).get(key, "")).strip()
+        if self._cp.has_option(section, key):
+            return self._cp.get(section, key).strip()
+        return None
+
+    def get(self, section, key):
+        value = self._explicit(section, key)
+        if value is None and (section, key) in LEGACY:
+            value = self._explicit(*LEGACY[(section, key)])
+        if value is None:
+            value = DEFAULTS.get(section, {}).get(key, "")
+        return value
 
     def getint(self, section, key):
         try:

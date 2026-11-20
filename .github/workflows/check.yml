@@ -36,6 +36,34 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: call fx.bat report < NUL
+      - name: Windows background start, status and stop (no outside network needed)
+        if: runner.os == 'Windows'
+        shell: cmd
+        env:
+          FXNEWS_HOME: ${{ runner.temp }}\fxhome
+          FXNEWS_RATES_URL: http://127.0.0.1:9/ticker
+          FXNEWS_GENERAL_SLEEP_BLOCK: "no"
+          FXNEWS_NOPAUSE: "1"
+        run: |
+          mkdir "%FXNEWS_HOME%"
+          echo {"feeds": [], "edgar": {}, "x": {"rules": []}} > "%FXNEWS_HOME%\sources.json"
+          echo ---- start-hidden.bat
+          call start-hidden.bat < NUL
+          echo ---- status must say running (exit code 0)
+          call fx.bat status < NUL
+          if errorlevel 1 exit /b 1
+          echo ---- a second copy must refuse to start (exit code 3)
+          call fx.bat run --seconds 1 < NUL
+          if not errorlevel 3 exit /b 1
+          echo ---- stop.bat
+          call stop.bat < NUL
+          if errorlevel 1 exit /b 1
+          echo ---- status must say stopped (exit code 1)
+          call fx.bat status < NUL
+          if not errorlevel 1 exit /b 1
+          echo ---- the log file
+          type "%FXNEWS_HOME%\data\fxnews.log"
+          exit /b 0
 
   live:
     name: live check against the real sources

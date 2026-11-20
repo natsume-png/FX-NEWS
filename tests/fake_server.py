@@ -1,10 +1,11 @@
 """テスト用の「にせのサーバー」。
 
-本物の相手(ニュースサイト、SEC、GMOコイン、Claude、ntfy、X)のふりをして、
+本物の相手(ニュースサイト、SEC、GMOコイン、Claude、ntfy、Pushover、X)のふりをして、
 決めた返事を返す。外のネットにはつながない。
 """
 
 import json
+import re
 import threading
 import time
 from email.utils import formatdate
@@ -65,10 +66,20 @@ class FakeState:
         # ntfy
         self.ntfy = []
         self.ntfy_status = 200
+        # Pushover
+        self.pushover = []  # 受け取った通知(フォームの中身)
+        self.pushover_hits = 0
+        self.pushover_status = 200  # 200 以外にすると、その番号のエラーを返す
+        self.pushover_fail_first = 0  # この回数だけ、先に 500 を返す
+        self.pushover_limit = 10000
+        self.pushover_remaining = 9000
+        self.pushover_reset = int(time.time()) + 5 * 86400
+        self.pushover_queries = []  # 残りの数・音の一覧を聞きに来たときの (道, token)
         # Claude
         self.claude_reqs = []
-        self.claude_mode = "ok"  # ok / need_legacy_auth / reject_format / error500 / garbage
+        self.claude_mode = "ok"  # ok / need_legacy_auth / need_workspace / reject_format / error500 / garbage
         self.news_answer = dict(NEWS_ANSWER)
+        self.spike_cause = "直前のニュースには、はっきりした原因は見当たりません"
         # X
         self.x_rules = []
         self.x_rule_posts = []
@@ -104,6 +115,16 @@ def _rss(state):
     parts.append("</channel></rss>")
     return "\n".join(parts).encode("utf-8")
 
+
+PUSHOVER_KEY = re.compile(r"^[A-Za-z0-9]{30}$")
+PUSHOVER_SOUNDS = (
+    ("pushover", "Pushover (default)"), ("bike", "Bike"), ("bugle", "Bugle"), ("cashregister", "Cash Register"),
+    ("classical", "Classical"), ("cosmic", "Cosmic"), ("falling", "Falling"), ("gamelan", "Gamelan"),
+    ("incoming", "Incoming"), ("intermission", "Intermission"), ("magic", "Magic"), ("mechanical", "Mechanical"),
+    ("pianobar", "Piano Bar"), ("siren", "Siren"), ("spacealarm", "Space Alarm"), ("tugboat", "Tug Boat"),
+    ("alien", "Alien Alarm (long)"), ("climb", "Climb (long)"), ("persistent", "Persistent (long)"),
+    ("echo", "Pushover Echo (long)"), ("updown", "Up Down (long)"), ("vibrate", "Vibrate Only"), ("none", "None (silent)"),
+)
 
 ITEM_TEXT = {
     "2.02": "Results of Operations and Financial Condition",
@@ -173,13 +194,17 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, status, obj, extra=None):
         self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json", extra)
 
-    def _read_json(self):
+    def _read_raw(self):
         length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except ValueError:
-            return None
+        return self.rfile.read(length) if length else b""
+
+    def _pushover_headers(self):
+        st = self.state
+        return {
+            "X-Limit-App-Limit": str(st.pushover_limit),
+            "X-Limit-App-Remaining": str(st.pushover_remaining),
+            "X-Limit-App-Reset": str(st.pushover_reset),
+        }
 
     def do_GET(self):
         st = self.state
@@ -225,6 +250,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, INDEX_HTML.encode("utf-8"), "text/html")
         elif path.startswith("/sec/Archives/") and path.endswith("q3fy27pr.htm"):
             self._send(200, PRESS_HTML.encode("utf-8"), "text/html")
+        elif path in ("/pushover/1/apps/limits.json", "/pushover/1/sounds.json"):
+            token = (parse_qs(url.query).get("token") or [""])[0]
+            with st.lock:
+                st.pushover_queries.append((path, token))
+                extra = self._pushover_headers()
+                limits = {"limit": st.pushover_limit, "remaining": st.pushover_remaining, "reset": st.pushover_reset, "status": 1}
+            if not PUSHOVER_KEY.match(token):
+                self._json(400, {"token": "invalid", "errors": ["application token is invalid"], "status": 0})
+            elif path.endswith("limits.json"):
+                self._json(200, limits, extra)
+            else:
+                self._json(200, {"sounds": dict(PUSHOVER_SOUNDS), "status": 1}, extra)
         elif path == "/x/2/tweets/search/stream/rules":
             with st.lock:
                 st.x_auth.append(self.headers.get("Authorization"))
@@ -264,8 +301,33 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         st = self.state
         path = urlparse(self.path).path
-        body = self._read_json()
-        if path in ("/ntfy/", "/ntfy"):
+        raw = self._read_raw()
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            body = None
+        if path == "/pushover/1/messages.json":
+            form = {k: v[0] for k, v in parse_qs(raw.decode("utf-8"), keep_blank_values=True).items()}
+            with st.lock:
+                st.pushover_hits += 1
+                status = st.pushover_status
+                if st.pushover_fail_first > 0:
+                    st.pushover_fail_first -= 1
+                    status = 500
+                ok = status == 200 and PUSHOVER_KEY.match(form.get("token", "")) and PUSHOVER_KEY.match(form.get("user", "")) and form.get("message")
+                if ok:
+                    st.pushover.append(form)
+                    st.pushover_remaining -= 1
+                extra = self._pushover_headers()
+            if status == 429:
+                self._json(429, {"status": 0, "errors": ["application has exceeded its monthly message limit"]}, extra)
+            elif status != 200:
+                self._json(status, {"status": 0, "errors": ["something went wrong"]})
+            elif not ok:
+                self._json(400, {"status": 0, "token": "invalid", "errors": ["application token is invalid"]}, extra)
+            else:
+                self._json(200, {"status": 1, "request": "req-%d" % len(st.pushover)}, extra)
+        elif path in ("/ntfy/", "/ntfy"):
             with st.lock:
                 status = st.ntfy_status
                 if status == 200:
@@ -280,6 +342,9 @@ class Handler(BaseHTTPRequestHandler):
                 st.claude_reqs.append({"headers": headers, "body": body})
                 mode = st.claude_mode
                 answer = dict(st.news_answer)
+            if mode == "need_workspace" and "anthropic-workspace-id" not in headers:
+                self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "anthropic-workspace-id header is required for this API key (workspace not specified)"}})
+                return
             if mode == "need_legacy_auth" and "x-api-key" not in headers:
                 self._json(401, {"type": "error", "error": {"type": "authentication_error", "message": "invalid bearer"}})
                 return
@@ -293,7 +358,9 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "garbage":
                 text = "すみません、JSON にできませんでした"
             elif "急な動き" in system:
-                text = json.dumps({"cause": "直前のニュースには、はっきりした原因は見当たりません"}, ensure_ascii=False)
+                with st.lock:
+                    cause = st.spike_cause
+                text = json.dumps({"cause": cause}, ensure_ascii=False)
             elif system.startswith("「OK」"):
                 text = "OK"
             else:

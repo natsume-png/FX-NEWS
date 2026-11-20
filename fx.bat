@@ -19,6 +19,7 @@ if not defined PY (
 )
 %PY% run.py %*
 set "RC=%errorlevel%"
+if defined FXNEWS_NOPAUSE exit /b %RC%
 echo.
 pause
 exit /b %RC%

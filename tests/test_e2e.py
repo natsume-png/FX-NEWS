@@ -20,6 +20,10 @@ from fxnews.store import Store  # noqa: E402
 from tests.fake_server import start_server  # noqa: E402
 
 
+PO_USER = "u" + "A1b2C3d4E5" * 2 + "f6G7H8i9J"  # にせの受け取り番号(英数字30文字)
+PO_TOKEN = "a" + "Z9y8X7w6V5" * 2 + "u4T3s2R1q"  # にせの送り主の番号(英数字30文字)
+
+
 def wait_for(cond, timeout=15.0, step=0.05):
     end = time.time() + timeout
     while time.time() < end:
@@ -39,6 +43,12 @@ def write_config(tmp, state, **over):
         "day_cap": "300",
         "claude_cap": "2000",
         "min_importance": "3",
+        "service": "ntfy",
+        "po_user": PO_USER,
+        "po_token": PO_TOKEN,
+        "po_day": "200",
+        "po_month": "5000",
+        "po_reserve": "1500",
     }
     values.update(over)
     text = """
@@ -46,10 +56,19 @@ def write_config(tmp, state, **over):
 api_key = {claude_key}
 api_base = {base}/claude
 monthly_cap_yen = {claude_cap}
+[notify]
+service = {service}
+min_importance = {min_importance}
 [ntfy]
 server = {base}/ntfy
 topic = {topic}
-min_importance = {min_importance}
+[pushover]
+api_base = {base}/pushover
+user_key = {po_user}
+api_token = {po_token}
+daily_limit = {po_day}
+monthly_limit = {po_month}
+reserve = {po_reserve}
 [x]
 bearer_token = {x_token}
 api_base = {base}/x
@@ -409,7 +428,7 @@ class OperationTest(unittest.TestCase):
 
             code, out = call("run", "--dry", "--replay", "1", "--seconds", "1.5")
             self.assertEqual(code, 0, out)
-            self.assertIn("FX見張り番 0.1.0 を始めます", out)
+            self.assertIn("FX見張り番 0.2.0 を始めます", out)
             self.assertIn("[通知] 円↓ ドル↑｜FRB理事が追加の利上げに言及", out)
             self.assertIn("(お試しモード: 送っていません)", out)
             self.assertIn("[おわり]", out)
