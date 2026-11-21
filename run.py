@@ -516,6 +516,13 @@ def cmd_autostart_on(cfg, home):
         (cfg.data_dir / AUTOSTART_OFF).unlink()
     except OSError:
         pass
+    try:  # 入った仕事の中身を、あとから見返せるように残す(鍵や番号は入っていない)
+        _code, detail = schtasks("/Query", "/TN", AUTOSTART_TASK, "/V", "/FO", "LIST")
+        (cfg.data_dir / "autostart_last.txt").write_text(
+            "%s(日本時間)に入れました。\n\n%s\n" % (jst(None, "%Y-%m-%d %H:%M:%S"), detail), encoding="utf-8"
+        )
+    except OSError:
+        pass
     say("止まっても自分で始めなおす仕組みを入れました(タスク スケジューラの「%s」)。" % AUTOSTART_TASK)
     say("・%d分おきに、見張りが動いているかを見て、止まっていたら始めます(動いていれば、何もしません)。" % AUTOSTART_EVERY_MIN)
     say("・パソコンを立ち上げなおしたあとも、サインインして%d分以内に、自分で始まります。" % AUTOSTART_EVERY_MIN)
