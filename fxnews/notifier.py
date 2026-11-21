@@ -52,12 +52,26 @@ def news_tags(res):
     return {"JPY": res["jpy"], "USD": res["usd"], "EUR": res["eur"], "GBP": res["gbp"]}
 
 
-def build_news_notification(item, res):
-    """ニュースの通知の (見出し, 本文, 鳴らし方の強さ) を作る。"""
+USDJPY_JA = {"up": "上がりやすい", "down": "下がりやすい"}
+
+
+def build_news_notification(item, res, record=""):
+    """ニュースの通知の (見出し, 本文, 鳴らし方の強さ) を作る。
+
+    見出しの先頭は、Claude の見立て。ドル円の向きが読めたときは「ドル円↑」「ドル円↓」、
+    読めなかったときは、動きそうな通貨の札(円↑ ドル↓ など)。
+    record は、「この型のニュースのあと、過去にドル円がどう動いたか」の1行(stats.kata_line が作る)。
+    """
     tags = news_tags(res)
-    head = tag_line(tags, only_moves=True)
+    usdjpy = res.get("usdjpy", "flat")
+    if usdjpy in USDJPY_JA:
+        head = "ドル円%s" % ARROW[usdjpy]
+    else:
+        head = tag_line(tags, only_moves=True)
     title = "%s｜%s" % (head, res["title"]) if head else res["title"]
     lines = []
+    if record:
+        lines.append(record)
     if res.get("summary"):
         lines.append(res["summary"])
     if res.get("reason"):
@@ -65,7 +79,10 @@ def build_news_notification(item, res):
     if res.get("raw"):
         lines.append("(解説なし: %s)" % res.get("raw_reason", "Claude が使えませんでした"))
     else:
-        lines.append("%s(見立て・確からしさ: %s)" % (tag_line(tags), CONF_JA.get(res.get("confidence"), "低")))
+        guess = "%s(見立て・確からしさ: %s)" % (tag_line(tags), CONF_JA.get(res.get("confidence"), "低"))
+        if usdjpy in USDJPY_JA:
+            guess = "ドル円は%s｜%s" % (USDJPY_JA[usdjpy], guess)
+        lines.append(guess)
     when = jst(item.published or item.fetched, "%H:%M")
     lines.append("%s・重要度 %d/5・%s・%s" % (res["category"], res["importance"], item.source_name, when))
     if not res.get("raw") and item.title and item.title != res["title"]:

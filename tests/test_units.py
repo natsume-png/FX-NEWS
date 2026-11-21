@@ -363,7 +363,8 @@ class AnalyzerTest(unittest.TestCase):
         self.assertEqual(keys, set(analyzer.NEWS_SCHEMA["required"]))
         sample = {k: ("flat" if k in ("jpy", "usd", "eur", "gbp") else "x") for k in keys}
         sample.update({"importance": 3, "dup": False, "title": "t"})
-        self.assertEqual(set(analyzer.normalize_news(sample)), keys)
+        # kata_ver(型の表の版)は、Claude に書かせるのではなく、こちらでつける
+        self.assertEqual(set(analyzer.normalize_news(sample)), keys | {"kata_ver"})
 
 
 class NotifierTest(unittest.TestCase):

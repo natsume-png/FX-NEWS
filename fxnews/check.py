@@ -9,7 +9,7 @@ from .edgar import EdgarPoller
 from .feeds import FeedPoller
 from .net import request
 from .notifier import Notifier
-from .rates import PAIR_JA, PAIRS, fmt_price, parse_ticker
+from .rates import PAIR_JA, PAIRS, Maintenance, fmt_price, parse_ticker
 from .store import Store
 from .util import jst, mask_secret
 from .xstream import XStream
@@ -76,6 +76,8 @@ def run_check(cfg, sources, out=print):
         else:
             out("  OK  6つの組合せを取れました(%.1f秒)。取引時間中: %s" % (took, "はい" if open_pairs else "いいえ(週末など)"))
         out("        " + " / ".join("%s %s" % (PAIR_JA[p], fmt_price(p, mids[p])) for p in PAIRS if p in mids))
+    except Maintenance:
+        out("  --  配信が点検中です(故障ではありません。GMOコインは、毎週土曜の 9:00〜11:00 が定期の点検です)")
     except Exception as exc:
         bad += 1
         out("  NG  %s" % exc)
@@ -117,6 +119,12 @@ def run_check(cfg, sources, out=print):
         if not ok:
             bad += 1
         out("  %s  鍵: %s / %s" % ("OK" if ok else "NG", mask_secret(analyzer.key), note))
+        if ok:
+            # 見本のニュース(作りもの)を1件、型に分けてもらう。型ごとの成績を数える土台が動くかの確かめ
+            fine, text = analyzer.selftest()
+            if not fine:
+                bad += 1
+            out("  %s  %s" % ("OK" if fine else "NG", text))
     out("")
 
     notifier = Notifier(cfg, store)

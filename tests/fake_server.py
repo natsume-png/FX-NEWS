@@ -60,6 +60,7 @@ class FakeState:
             "AUD_JPY": 107.020,
         }
         self.market_status = "OPEN"
+        self.ticker_mode = "ok"  # ok / maintenance(点検中の返事) / error(ほかのエラーの返事)
         self.ticker_ports = []  # 為替レートを取りに来た接続の番号(同じ番号なら、つないだまま使い回している)
         self.ticker_hits = 0
         self.drop_ticker_after = 0  # 0 以外なら、その回数ごとに相手(にせのサーバー)から接続を切る
@@ -77,7 +78,7 @@ class FakeState:
         self.pushover_queries = []  # 残りの数・音の一覧を聞きに来たときの (道, token)
         # Claude
         self.claude_reqs = []
-        self.claude_mode = "ok"  # ok / need_legacy_auth / need_workspace / reject_format / error500 / garbage
+        self.claude_mode = "ok"  # ok / need_legacy_auth / need_workspace / reject_format / error500 / garbage / credit / bad_key
         self.news_answer = dict(NEWS_ANSWER)
         self.spike_cause = "直前のニュースには、はっきりした原因は見当たりません"
         # X
@@ -234,7 +235,15 @@ class Handler(BaseHTTPRequestHandler):
                     {"symbol": s, "ask": "%.5f" % (p * 1.00002), "bid": "%.5f" % (p * 0.99998), "timestamp": iso_now(), "status": st.market_status}
                     for s, p in st.prices.items()
                 ]
-            self._json(200, {"status": 0, "data": rows, "responsetime": iso_now()})
+                ticker_mode = st.ticker_mode
+            if ticker_mode == "maintenance":
+                self._json(200, {"status": 5, "messages": [{"message_code": "ERR-5201", "message_string": "MAINTENANCE. Please wait for a while"}], "responsetime": iso_now()})
+            elif ticker_mode == "maintenance503":
+                self._json(503, {"status": 5, "messages": [{"message_code": "ERR-5201", "message_string": "MAINTENANCE. Please wait for a while"}], "responsetime": iso_now()})
+            elif ticker_mode == "error":
+                self._json(200, {"status": 1, "messages": [{"message_code": "ERR-5003", "message_string": "Requests are too many."}], "responsetime": iso_now()})
+            else:
+                self._json(200, {"status": 0, "data": rows, "responsetime": iso_now()})
         elif path == "/sec/files/company_tickers.json":
             with st.lock:
                 st.sec_agents.append(self.headers.get("User-Agent"))
@@ -354,6 +363,12 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "error500":
                 self._json(500, {"type": "error", "error": {"type": "api_error", "message": "boom"}})
                 return
+            if mode == "credit":
+                self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}})
+                return
+            if mode == "bad_key":
+                self._json(401, {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}})
+                return
             system = (body or {}).get("system", "")
             if mode == "garbage":
                 text = "すみません、JSON にできませんでした"
@@ -369,6 +384,9 @@ class Handler(BaseHTTPRequestHandler):
                     answer["dup"] = True
                 if "LOWTEST" in user:
                     answer["importance"] = 1
+                if "self-test" in user and mode != "selftest_wrong":
+                    # 型分けの試し(見本の雇用統計)には、思ったとおりの型で答える
+                    answer.update({"category": "経済指標", "title": "米雇用統計は予想を大きく上回る", "kata": "us_data", "muki": "strong", "usdjpy": "up", "tag": "雇用統計"})
                 text = json.dumps(answer, ensure_ascii=False)
             self._json(200, {
                 "id": "msg_test",

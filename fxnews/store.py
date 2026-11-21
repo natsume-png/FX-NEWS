@@ -2,6 +2,8 @@
 
 - 一度あつかった記事の目印(二重に知らせないため)
 - 知らせた内容と、そのあとの値動き(答え合わせ用)
+- ニュースの型と向き、本文(型ごとに「そのあとドル円がどう動いたか」を数える用)
+- 1分ごとの為替の値(ニュースの何分後・何日後の値でも、あとから引けるようにする)
 - 使った量(Claude の料金、X の件数、通知の数)
 """
 
@@ -24,7 +26,22 @@ CREATE TABLE IF NOT EXISTS items(
 );
 CREATE INDEX IF NOT EXISTS idx_items_ts ON items(ts);
 CREATE TABLE IF NOT EXISTS usage(period TEXT, kind TEXT, amount REAL, PRIMARY KEY(period, kind));
+CREATE TABLE IF NOT EXISTS rate_min(
+  ts INTEGER NOT NULL, pair TEXT NOT NULL, o REAL, h REAL, l REAL, c REAL, n INTEGER,
+  PRIMARY KEY(pair, ts)
+) WITHOUT ROWID;
 """
+# rate_min は、1分ごとの値。ts はその1分のはじめの時刻(UNIX 秒)。o・h・l・c は、始めの値・いちばん高い値・
+# いちばん安い値・終わりの値(売値と買値の真ん中)。n は、その1分に値を取った回数。
+
+# あとから足した列(前の版で作った記録にも、起動のときに足す)
+ITEM_COLUMNS_ADDED = (
+    ("text", "TEXT"),  # 本文(型の決め方を変えたときに、分け直せるように残す)
+    ("kata", "TEXT"),  # 型(例: us_data = 米国の経済指標)
+    ("muki", "TEXT"),  # 向き(例: strong = 予想より強い)
+    ("usdjpy", "TEXT"),  # Claude の見立て(up / down / flat)
+    ("dup", "INTEGER"),  # 前に出た話のくり返しなら 1(数えるときに、二重に数えないため)
+)
 
 OUTCOME_STEPS = (("out5", 300), ("out15", 900), ("out60", 3600))
 
@@ -39,6 +56,11 @@ class Store:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(SCHEMA)
+            have = {r["name"] for r in self._db.execute("PRAGMA table_info(items)").fetchall()}
+            for name, kind in ITEM_COLUMNS_ADDED:
+                if name not in have:
+                    self._db.execute("ALTER TABLE items ADD COLUMN %s %s" % (name, kind))
+            self._db.execute("CREATE INDEX IF NOT EXISTS idx_items_kata ON items(kata, muki)")
             self._db.commit()
 
     def close(self):
@@ -74,10 +96,21 @@ class Store:
 
     # ---- あつかった情報の記録 ----
     def add_item(self, item, analysis=None, importance=None, title_ja="", mids=None):
+        """あつかった情報を1件、記録する。
+
+        ts は、このプログラムが受け取った時刻(= 利用者の手もとに届く時刻のめやす)。
+        あとから「届いたあと、相場がどう動いたか」を数えるときの起点にする。
+        本文(text)も残す。型の決め方を変えて、分け直せるようにするため。
+        """
+        kata = muki = usdjpy = None
+        dup = 0
+        if isinstance(analysis, dict):
+            kata, muki, usdjpy = analysis.get("kata"), analysis.get("muki"), analysis.get("usdjpy")
+            dup = 1 if analysis.get("dup") else 0
         with self._lock:
             cur = self._db.execute(
                 "INSERT INTO items(ts, source, source_name, kind, key, title, url, published, title_ja, analysis, "
-                "importance, mids) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "importance, mids, text, kata, muki, usdjpy, dup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     time.time(),
                     item.source,
@@ -91,6 +124,11 @@ class Store:
                     json.dumps(analysis, ensure_ascii=False) if analysis is not None else None,
                     importance,
                     json.dumps(mids) if mids else None,
+                    (getattr(item, "text", "") or "")[:6000] or None,
+                    kata,
+                    muki,
+                    usdjpy,
+                    dup,
                 ),
             )
             self._db.commit()
@@ -155,6 +193,89 @@ class Store:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    # ---- 1分ごとの値(あとから、何分後・何日後の値でも引けるようにする) ----
+    def add_rate_bars(self, rows):
+        """rows は (その1分のはじめの時刻, 通貨ペア, 始めの値, 高い値, 安い値, 終わりの値, 回数) の並び。
+
+        同じ1分の記録がもうあるとき(その1分の途中で、見張りを止めて始めなおしたとき)は、1つにまとめる:
+        始めの値は前のまま、高い値・安い値は広いほう、終わりの値は新しいほう、回数は足す。
+        """
+        if not rows:
+            return
+        with self._lock:
+            self._db.executemany(
+                "INSERT INTO rate_min(ts, pair, o, h, l, c, n) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(pair, ts) DO UPDATE SET h=MAX(h, excluded.h), l=MIN(l, excluded.l), "
+                "c=excluded.c, n=n+excluded.n",
+                rows,
+            )
+            self._db.commit()
+
+    def rate_at(self, pair, ts, max_gap=300):
+        """ts の時点の値。なければ None(相場が閉まっている時間や、見張りが止まっていた時間)。
+
+        - ts をふくむ1分の記録があれば、その1分の前半なら始めの値、後半なら終わりの値(ずれは長くて30秒)。
+        - なければ、前後 max_gap 秒までで、時刻がいちばん近い記録の値(前の1分の終わりの値か、後の1分の始めの値)。
+        """
+        start = int(ts // 60) * 60
+        with self._lock:
+            row = self._db.execute("SELECT o, c FROM rate_min WHERE pair=? AND ts=?", (pair, start)).fetchone()
+            if row is not None:
+                return row["o"] if ts - start < 30 else row["c"]
+            nxt = self._db.execute(
+                "SELECT ts, o FROM rate_min WHERE pair=? AND ts>? AND ts<=? ORDER BY ts LIMIT 1",
+                (pair, start, int(ts + max_gap)),
+            ).fetchone()
+            prv = self._db.execute(
+                "SELECT ts, c FROM rate_min WHERE pair=? AND ts<? AND ts>=? ORDER BY ts DESC LIMIT 1",
+                (pair, start, int(ts - max_gap) - 60),
+            ).fetchone()
+        gap_next = nxt["ts"] - ts if nxt is not None else None
+        gap_prev = ts - (prv["ts"] + 60) if prv is not None else None
+        if gap_prev is not None and gap_prev > max_gap:
+            gap_prev = None
+        if gap_next is None and gap_prev is None:
+            return None
+        if gap_next is None or (gap_prev is not None and gap_prev <= gap_next):
+            return prv["c"]
+        return nxt["o"]
+
+    def rate_bars(self, pair, since_ts, until_ts):
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT ts, o, h, l, c, n FROM rate_min WHERE pair=? AND ts>=? AND ts<=? ORDER BY ts",
+                (pair, int(since_ts), int(until_ts)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def count_rate_bars(self):
+        with self._lock:
+            return self._db.execute("SELECT COUNT(*) AS n FROM rate_min").fetchone()["n"]
+
+    def kata_rows(self, since_ts, kata=None, muki=None, min_importance=0):
+        """型のついた記録(受け取った時刻と、そのときの値)。古い順。前に出た話のくり返しは入れない。
+
+        kata と muki を指定すると、その型・その向きだけ。
+        """
+        sql = (
+            "SELECT id, ts, published, source, kind, title_ja, importance, kata, muki, usdjpy, mids FROM items "
+            "WHERE kata IS NOT NULL AND mids IS NOT NULL AND COALESCE(dup, 0)=0 AND ts>=? AND COALESCE(importance, 0)>=?"
+        )
+        args = [since_ts, min_importance]
+        if kata is not None:
+            sql += " AND kata=?"
+            args.append(kata)
+        if muki is not None:
+            sql += " AND muki=?"
+            args.append(muki)
+        sql += " ORDER BY ts"
+        with self._lock:
+            return [dict(r) for r in self._db.execute(sql, args).fetchall()]
+
+    def count_kata_items(self):
+        with self._lock:
+            return self._db.execute("SELECT COUNT(*) AS n FROM items WHERE kata IS NOT NULL").fetchone()["n"]
+
     # ---- 使った量 ----
     def usage_add(self, period, kind, amount):
         with self._lock:
@@ -171,9 +292,10 @@ class Store:
             return float(row["amount"]) if row else 0.0
 
     # ---- 古い記録の片づけ ----
-    def prune(self, seen_days=400, item_days=400):
+    def prune(self, seen_days=400, item_days=800, rate_days=800):
         now = time.time()
         with self._lock:
             self._db.execute("DELETE FROM seen WHERE ts<?", (now - seen_days * 86400,))
             self._db.execute("DELETE FROM items WHERE ts<?", (now - item_days * 86400,))
+            self._db.execute("DELETE FROM rate_min WHERE ts<?", (int(now - rate_days * 86400),))
             self._db.commit()

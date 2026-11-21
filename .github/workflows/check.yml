@@ -14,7 +14,7 @@ jobs:
   tests:
     name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +63,56 @@ jobs:
           if not errorlevel 1 exit /b 1
           echo ---- the log file
           type "%FXNEWS_HOME%\data\fxnews.log"
+          exit /b 0
+      - name: Windows keep-alive through Task Scheduler (no outside network needed)
+        if: runner.os == 'Windows'
+        shell: cmd
+        env:
+          FXNEWS_HOME: ${{ runner.temp }}\fxhome2
+          FXNEWS_RATES_URL: http://127.0.0.1:9/ticker
+          FXNEWS_GENERAL_SLEEP_BLOCK: "no"
+          FXNEWS_NOPAUSE: "1"
+        run: |
+          mkdir "%FXNEWS_HOME%"
+          echo {"feeds": [], "edgar": {}, "x": {"rules": []}} > "%FXNEWS_HOME%\sources.json"
+          echo ---- autostart-on.bat: installs the Task Scheduler entry and starts the watcher
+          call autostart-on.bat < NUL
+          echo ---- the Task Scheduler entry must exist
+          schtasks /Query /TN "FX-NEWS mihari" /V /FO LIST
+          if errorlevel 1 exit /b 1
+          schtasks /Query /TN "FX-NEWS mihari" /XML
+          echo ---- status must say running (exit code 0)
+          call fx.bat status < NUL
+          if errorlevel 1 exit /b 1
+          echo ---- stop.bat must stop it and pause the keep-alive
+          call stop.bat < NUL
+          if errorlevel 1 exit /b 1
+          if not exist "%FXNEWS_HOME%\data\autostart.off" exit /b 1
+          echo ---- while paused, the keep-alive must not start it (exit code 0, still stopped)
+          call fx.bat run --auto < NUL
+          if errorlevel 1 exit /b 1
+          call fx.bat status < NUL
+          if not errorlevel 1 exit /b 1
+          echo ---- start-hidden.bat must start it again and clear the pause
+          call start-hidden.bat < NUL
+          call fx.bat status < NUL
+          if errorlevel 1 exit /b 1
+          if exist "%FXNEWS_HOME%\data\autostart.off" exit /b 1
+          echo ---- while running, the keep-alive must do nothing (exit code 0)
+          call fx.bat run --auto < NUL
+          if errorlevel 1 exit /b 1
+          echo ---- update.bat must stop and start it (a new version would be picked up here)
+          call update.bat < NUL
+          call fx.bat status < NUL
+          if errorlevel 1 exit /b 1
+          echo ---- stop, then remove the keep-alive
+          call stop.bat < NUL
+          if errorlevel 1 exit /b 1
+          call autostart-off.bat < NUL
+          schtasks /Query /TN "FX-NEWS mihari" >nul 2>nul
+          if not errorlevel 1 exit /b 1
+          echo ---- the record of commands
+          type "%FXNEWS_HOME%\data\commands.log"
           exit /b 0
 
   live:

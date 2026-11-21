@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fxnews import notifier, single, util, winconsole  # noqa: E402
+from fxnews import __version__, notifier, single, util, winconsole  # noqa: E402
 from fxnews.app import ALIVE_FILE, STOP_FILE, App  # noqa: E402
 from fxnews.check import run_check  # noqa: E402
 from fxnews.config import Config  # noqa: E402
@@ -387,7 +387,7 @@ class PushoverPipelineTest(unittest.TestCase):
         alive_path = Path(self.tmp.name) / "data" / ALIVE_FILE
         self.assertTrue(wait_for(alive_path.exists))
         alive = json.loads(alive_path.read_text(encoding="utf-8"))
-        self.assertEqual((alive["state"], alive["service"], alive["version"]), ("running", "pushover", "0.2.0"))
+        self.assertEqual((alive["state"], alive["service"], alive["version"]), ("running", "pushover", __version__))
         # 止めてほしいという合図のファイルを置くと、止まる
         stop_path = Path(self.tmp.name) / "data" / STOP_FILE
         stop_path.write_text("stop", encoding="utf-8")
@@ -461,11 +461,12 @@ class CommandTest(unittest.TestCase):
         self.assertIn("テスト通知を Pushover に送りました", out)
         self.assertEqual(self.state.pushover[1]["sound"], "bugle")
         self.assertEqual(self.state.ntfy, [])
-        # 受け取り番号がもう入っていれば、何も打たずに Enter でそのまま使える
-        ask = answers("", PO_TOKEN)
+        # 受け取り番号がもう入っていれば、たずねるのは送り主の番号の1回だけ(v0.3 から)
+        ask = answers(PO_TOKEN)
         code, out = call(self.run.cmd_setup_pushover, Config(self.home), ask)
         self.assertEqual(code, 0, out)
         self.assertIn("もう入っています", out)
+        self.assertEqual(len(ask.asked), 1)
 
     def test_setup_pushover_keeps_config_when_it_fails(self):
         cfg = self.config(po_user="", po_token="")

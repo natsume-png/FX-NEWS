@@ -8,11 +8,14 @@
   python run.py setup-sec        米国 SEC(会社の届け出)に名乗る連絡先を入れる
   python run.py topic            ntfy(通知アプリ)を使うときの、通知のあて先を作る
   python run.py test-notify      ためしに通知を1通送る
-  python run.py run              見張りを始める(何も書かずに python run.py でも同じ)
+  python run.py run              見張りを始める(この画面で動かす。何も書かずに python run.py でも同じ)
+  python run.py start            見張りを、黒い画面なしで始める
   python run.py status           見張りが動いているかを見る
   python run.py stop             動いている見張りを止める
+  python run.py autostart-on     止まっても自分で始めなおす仕組みを入れる(Windows だけ)
+  python run.py autostart-off    その仕組みを外す
   python run.py version          版の番号を出す
-  python run.py report           分類の答え合わせを表示する
+  python run.py report           型ごとの成績(ニュースのあと、ドル円がどう動いたか)と、分類の答え合わせを表示する
 """
 
 import argparse
@@ -22,6 +25,8 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -78,12 +83,12 @@ def setup_output(data_dir, to_file=True):
             pass
 
 
-def home_dir():
+def home_dir(explicit=None):
     """config.ini・sources.json・data フォルダを置く場所。ふつうは、このファイルと同じフォルダ。
 
-    環境変数 FXNEWS_HOME で、別のフォルダにできる(サーバーで動かすときやテスト用)。
+    --home か、環境変数 FXNEWS_HOME で、別のフォルダにできる(サーバーで動かすときやテスト用)。
     """
-    override = os.environ.get("FXNEWS_HOME")
+    override = explicit or os.environ.get("FXNEWS_HOME")
     return Path(override).resolve() if override else CODE_DIR
 
 
@@ -196,8 +201,12 @@ def cmd_test_notify(cfg):
 
 
 # ---- 鍵や番号を入れる ----
-def cmd_setup_pushover(cfg, ask=input):
-    """Pushover の番号2つをたずね、ためしに1通送り、送れたら config.ini に書く。"""
+def cmd_setup_pushover(cfg, ask=input, new_user=False):
+    """Pushover の番号2つをたずね、ためしに1通送り、送れたら config.ini に書く。
+
+    受け取り番号がもう入っていれば、たずねるのは送り主の番号の1回だけ
+    (new_user を True にすると、受け取り番号もたずねなおす)。
+    """
     from fxnews.notifier import PUSHOVER_KEY_RE, Notifier
     from fxnews.store import Store
 
@@ -214,10 +223,10 @@ def cmd_setup_pushover(cfg, ask=input):
     say("")
     hint = "英数字30文字ではないようです。もう一度、貼りつけてください。"
     user = cfg.get("pushover", "user_key")
-    if PUSHOVER_KEY_RE.match(user):
-        say("受け取り番号(User Key)は、もう入っています(%s)。" % mask_secret(user))
-        again = ask_line(ask, "入れなおすなら新しい番号を貼って Enter、このままなら何も打たずに Enter: ", PUSHOVER_KEY_RE.match, hint)
-        user = again or user
+    if PUSHOVER_KEY_RE.match(user) and not new_user:
+        say("受け取り番号(User Key)は、もう入っています(%s)。そのまま使います。" % mask_secret(user))
+        say("(受け取り番号を入れなおすときは、setup-pushover --new-user を実行します)")
+        say("")
     else:
         user = ask_line(ask, "受け取り番号(User Key)を貼って Enter: ", PUSHOVER_KEY_RE.match, hint)
         if not user:
@@ -339,6 +348,197 @@ def read_alive(cfg):
         return None
 
 
+AUTOSTART_TASK = "FX-NEWS mihari"  # Windows の「タスク スケジューラ」(決めた時刻に物を動かす係)に入れる仕事の名前
+AUTOSTART_OFF = "autostart.off"  # data フォルダにこのファイルがあるあいだは、自動では始めない(stop コマンドが作る)
+AUTOSTART_EVERY_MIN = 5  # 何分おきに「止まっていたら始める」を見るか
+
+
+def pythonw_path():
+    """黒い画面を出さずに動かす Python(pythonw)の場所。見つからなければ None。"""
+    exe = Path(sys.executable)
+    for name in ("pythonw.exe", "pythonw"):
+        cand = exe.with_name(name)
+        if cand.exists():
+            return cand
+    for name in ("pythonw", "pyw"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
+
+
+def spawn_watcher(home):
+    """見張りを、黒い画面なしで、このコマンドとは切りはなして始める。"""
+    exe = pythonw_path() or Path(sys.executable)
+    args = [str(exe), str(CODE_DIR / "run.py"), "--home", str(home), "run"]
+    kwargs = {"cwd": str(CODE_DIR), "close_fds": True}
+    if os.name == "nt":
+        # 0x00000008 = この画面(コンソール)につながない、0x00000200 = 別の組にする(画面を閉じても、道連れにしない)
+        kwargs["creationflags"] = 0x00000008 | 0x00000200
+    else:
+        kwargs.update({"start_new_session": True, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL})
+    subprocess.Popen(args, **kwargs)
+    return exe
+
+
+def schtasks(*args, timeout=30):
+    """Windows の schtasks(タスク スケジューラをあつかう、Windows に入っているコマンド)を動かす。(終わりの番号, 出た文字)。"""
+    if os.name != "nt":
+        return 1, "Windows ではありません"
+    try:
+        done = subprocess.run(
+            ["schtasks"] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    return done.returncode, done.stdout.decode("mbcs" if os.name == "nt" else "utf-8", errors="replace").strip()
+
+
+def autostart_installed():
+    """止まっても自分で始めなおす仕組み(タスク スケジューラの仕事)が、入っているか。"""
+    return schtasks("/Query", "/TN", AUTOSTART_TASK)[0] == 0
+
+
+def autostart_paused(cfg):
+    return (cfg.data_dir / AUTOSTART_OFF).exists()
+
+
+def current_user_id():
+    """タスク スケジューラに書く、いまの利用者のしるし(SID)。取れなければ「パソコン名\\利用者名」。"""
+    try:
+        done = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+        m = re.search(r"S-1-[0-9-]+", done.stdout.decode("mbcs", errors="replace"))
+        if m:
+            return m.group(0)
+    except (OSError, subprocess.SubprocessError, LookupError):
+        pass
+    return "%s\\%s" % (os.environ.get("USERDOMAIN", "."), os.environ.get("USERNAME", ""))
+
+
+def autostart_xml(exe, home, user_id, every_min=AUTOSTART_EVERY_MIN):
+    """タスク スケジューラに入れる仕事の中身(XML)。
+
+    - 決めた分おきに「見張りを始める」を動かす。もう動いていれば、タスク スケジューラは何もしない(2つは動かさない)。
+      きっかけは2つ書いてある(1回かぎり + くり返し、毎日 + くり返し)。片方が働かない Windows でも、もう片方で動くようにするため。
+    - 動かす時間に上限をつけない。電池で動いているときも止めない。
+    - この利用者がサインインしているあいだだけ、この利用者として、ふつうの権限で動く。
+    """
+    from xml.sax.saxutils import escape
+
+    arguments = '"%s" --home "%s" run --auto' % (CODE_DIR / "run.py", home)
+    return """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>FX-NEWS: keeps the news watcher running. Starts it again within %(every)d minutes if it has stopped. Remove with: run.py autostart-off</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT%(every)dM</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+    <CalendarTrigger>
+      <Repetition>
+        <Interval>PT%(every)dM</Interval>
+        <Duration>P1D</Duration>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:02:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>%(user)s</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>%(exe)s</Command>
+      <Arguments>%(args)s</Arguments>
+      <WorkingDirectory>%(cwd)s</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+""" % {
+        "every": int(every_min),
+        "user": escape(str(user_id)),
+        "exe": escape(str(exe)),
+        "args": escape(arguments),
+        "cwd": escape(str(CODE_DIR)),
+    }
+
+
+def cmd_autostart_on(cfg, home):
+    """止まっても自分で始めなおす仕組みを入れる(Windows のタスク スケジューラに、仕事を1つ足す)。"""
+    if os.name != "nt":
+        say("この仕組みは、Windows だけで使えます。")
+        return 1
+    exe = pythonw_path()
+    if exe is None:
+        say("黒い画面なしで動かす Python(pythonw)が見つからないので、入れられませんでした。")
+        return 1
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    xml_path = cfg.data_dir / "autostart_task.xml"
+    xml_path.write_text(autostart_xml(exe, home, current_user_id()), encoding="utf-16")
+    code, out = schtasks("/Create", "/TN", AUTOSTART_TASK, "/XML", str(xml_path), "/F")
+    if code != 0:
+        say("入れられませんでした: %s" % " ".join(out.split())[:300])
+        return 1
+    try:
+        (cfg.data_dir / AUTOSTART_OFF).unlink()
+    except OSError:
+        pass
+    say("止まっても自分で始めなおす仕組みを入れました(タスク スケジューラの「%s」)。" % AUTOSTART_TASK)
+    say("・%d分おきに、見張りが動いているかを見て、止まっていたら始めます(動いていれば、何もしません)。" % AUTOSTART_EVERY_MIN)
+    say("・パソコンを立ち上げなおしたあとも、サインインして%d分以内に、自分で始まります。" % AUTOSTART_EVERY_MIN)
+    say("・「見張りを止める」(stop)で止めたときは、止めたままにします。「見張りを始める」(start)で、また動かします。")
+    say("・外すときは autostart-off を実行します。")
+    return 0
+
+
+def cmd_autostart_off(cfg):
+    if os.name != "nt":
+        say("この仕組みは、Windows だけで使えます。")
+        return 1
+    if not autostart_installed():
+        say("自分で始めなおす仕組みは、入っていません。")
+        return 0
+    code, out = schtasks("/Delete", "/TN", AUTOSTART_TASK, "/F")
+    if code != 0:
+        say("外せませんでした: %s" % " ".join(out.split())[:300])
+        return 1
+    say("自分で始めなおす仕組みを外しました(いま動いている見張りは、そのまま動きつづけます)。")
+    return 0
+
+
 def cmd_status(cfg, home):
     """動いていれば 0、止まっていれば 1 を返す。"""
     from fxnews.single import is_running
@@ -352,12 +552,21 @@ def cmd_status(cfg, home):
         say("・最後のしるし: %s(%d秒前。動いているあいだは30秒ごとに書きます)" % (alive.get("jst", "?"), age))
         if running:
             say("・始めた時刻: %s" % alive.get("started", "?"))
+            if alive.get("version") and alive.get("version") != __version__:
+                say("・★動いているのは前の版(%s)です。止めて始めなおすと、新しい版(%s)になります" % (alive.get("version"), __version__))
             if age > 120:
                 say("・★しるしが2分より古いです。固まっているかもしれません。stop で止めてから、もう一度始めてください")
         say("・%s" % alive.get("summary", ""))
         failing = alive.get("failing") or {}
         for name, why in failing.items():
             say("・つながらない情報源: %s(%s)" % (name, str(why)[:80]))
+    if os.name == "nt":
+        if not autostart_installed():
+            say("・自分で始めなおす仕組み: 入っていません(パソコンを立ち上げなおしたら、手で始めます)")
+        elif autostart_paused(cfg):
+            say("・自分で始めなおす仕組み: 入っていますが、休ませています(stop で止めたため。start で、また動かします)")
+        else:
+            say("・自分で始めなおす仕組み: 入っています(止まっても、%d分以内に自分で始めます)" % AUTOSTART_EVERY_MIN)
     log_path = cfg.data_dir / "fxnews.log"
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
@@ -371,14 +580,53 @@ def cmd_status(cfg, home):
     return 0 if running else 1
 
 
+def cmd_start(cfg, home, wait=20.0):
+    """見張りを、黒い画面なしで始める。始まったら 0。"""
+    from fxnews.single import is_running
+
+    try:  # 「止めたままにする」のしるしを片づける
+        (cfg.data_dir / AUTOSTART_OFF).unlink()
+    except OSError:
+        pass
+    if is_running(home, cfg.data_dir):
+        say("見張り番は、もう動いています。")
+        return 0
+    how = ""
+    if os.name == "nt" and autostart_installed():
+        code, out = schtasks("/Run", "/TN", AUTOSTART_TASK)
+        how = "タスク スケジューラから" if code == 0 else ""
+        if code != 0:
+            say("(タスク スケジューラから始められなかったので、じかに始めます: %s)" % " ".join(out.split())[:200])
+    end = time.time() + (8.0 if how else 0.0)
+    while how and time.time() < end and not is_running(home, cfg.data_dir):
+        time.sleep(0.5)
+    if not is_running(home, cfg.data_dir):
+        exe = spawn_watcher(home)
+        how = "じかに(%s)" % exe.name
+    say("見張りを始めました(%s)。動きだすのを待っています…" % how)
+    end = time.time() + wait
+    while time.time() < end:
+        if is_running(home, cfg.data_dir):
+            alive = read_alive(cfg) or {}
+            if alive.get("state") == "running" and time.time() - float(alive.get("ts", 0)) < 60:
+                break
+        time.sleep(0.5)
+    say("")
+    return cmd_status(cfg, home)
+
+
 def cmd_stop(cfg, home, wait=40.0):
     from fxnews.app import STOP_FILE
     from fxnews.single import is_running
 
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt" and autostart_installed():
+        # 自分で始めなおす仕組みに、「止めたままにする」と伝える(start で、また動かせる)
+        (cfg.data_dir / AUTOSTART_OFF).write_text(jst(None, "%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+        say("自分で始めなおす仕組みは、休ませました(start を実行するまで、止めたままにします)。")
     if not is_running(home, cfg.data_dir):
         say("見張り番は、いま動いていません。")
         return 0
-    cfg.data_dir.mkdir(parents=True, exist_ok=True)
     (cfg.data_dir / STOP_FILE).write_text(jst(None, "%Y-%m-%d %H:%M:%S"), encoding="utf-8")
     say("止めるように頼みました。止まるのを待っています(長くて%d秒)…" % int(wait))
     end = time.time() + wait
@@ -393,31 +641,44 @@ def cmd_stop(cfg, home, wait=40.0):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="run.py", description="FX見張り番 %s" % __version__)
+    parser.add_argument("--home", default=None, help="config.ini と data フォルダを置く場所(ふつうは書かない)")
     sub = parser.add_subparsers(dest="cmd")
-    p_run = sub.add_parser("run", help="見張りを始める")
+    p_run = sub.add_parser("run", help="見張りを始める(この画面で動かす)")
     p_run.add_argument("--dry", action="store_true", help="スマホには送らず、画面に出すだけにする")
+    p_run.add_argument("--auto", action="store_true", help="自分で始めなおす仕組みから呼ぶとき用。もう動いていれば、何もせずに終わる")
     p_run.add_argument("--replay", type=int, default=0, metavar="N", help="お試し: それぞれの更新一覧のいちばん新しい N 件を、新着としてあつかう")
     p_run.add_argument("--seconds", type=float, default=None, help="この秒数で終わる(お試し用)")
     sub.add_parser("check", help="それぞれの情報源につながるかを点検する")
-    sub.add_parser("setup-pushover", help="Pushover の番号を入れて、ためしに1通送る")
+    p_po = sub.add_parser("setup-pushover", help="Pushover の番号を入れて、ためしに1通送る")
+    p_po.add_argument("--new-user", action="store_true", help="受け取り番号(User Key)も、入れなおす")
     sub.add_parser("setup-claude", help="Claude の鍵を入れて、つながるか確かめる")
     sub.add_parser("setup-sec", help="米国 SEC に名乗る連絡先を入れる")
     sub.add_parser("topic", help="通知のあて先(ntfy の topic)を作る")
     sub.add_parser("test-notify", help="ためしに通知を1通送る")
+    sub.add_parser("start", help="見張りを、黒い画面なしで始める")
     sub.add_parser("status", help="見張りが動いているかを見る")
     sub.add_parser("stop", help="動いている見張りを止める")
+    sub.add_parser("autostart-on", help="止まっても自分で始めなおす仕組みを入れる(Windows だけ)")
+    sub.add_parser("autostart-off", help="その仕組みを外す")
     sub.add_parser("version", help="版の番号を出す")
-    p_rep = sub.add_parser("report", help="分類の答え合わせを表示する")
+    p_rep = sub.add_parser("report", help="型ごとの成績と、分類の答え合わせを表示する")
     p_rep.add_argument("--days", type=int, default=7)
     args = parser.parse_args(argv)
     cmd = args.cmd or "run"
 
-    home = home_dir()
+    home = home_dir(args.home)
     cfg = Config(home)
+    if cmd == "run" and getattr(args, "auto", False):
+        # 自分で始めなおす仕組みから呼ばれた。もう動いている・止めたままにする、なら、何も残さずに終わる
+        from fxnews.single import is_running
+
+        if autostart_paused(cfg) or is_running(home, cfg.data_dir):
+            return 0
     setup_output(cfg.data_dir, to_file=(cmd == "run"))
     placed = place_console(cfg, cmd)
     if cmd == "run":
-        note_command(cfg, "run: 始めます%s" % ("(黒い画面なし)" if sys.stdout is None else ""))
+        how = "(黒い画面なし)" if sys.stdout is None else ""
+        note_command(cfg, "run: 始めます%s%s" % (how, "(自分で始めなおす仕組みから)" if getattr(args, "auto", False) else ""))
     code = None
     try:
         code = dispatch(args, cmd, home, cfg)
@@ -436,15 +697,21 @@ def dispatch(args, cmd, home, cfg):
     if cmd == "test-notify":
         return cmd_test_notify(cfg)
     if cmd == "setup-pushover":
-        return cmd_setup_pushover(cfg)
+        return cmd_setup_pushover(cfg, new_user=getattr(args, "new_user", False))
     if cmd == "setup-claude":
         return cmd_setup_claude(cfg)
     if cmd == "setup-sec":
         return cmd_setup_sec(cfg)
     if cmd == "status":
         return cmd_status(cfg, home)
+    if cmd == "start":
+        return cmd_start(cfg, home)
     if cmd == "stop":
         return cmd_stop(cfg, home)
+    if cmd == "autostart-on":
+        return cmd_autostart_on(cfg, home)
+    if cmd == "autostart-off":
+        return cmd_autostart_off(cfg)
 
     sources = load_sources(home if (home / "sources.json").exists() else CODE_DIR)
     if cmd == "check":
@@ -465,11 +732,15 @@ def dispatch(args, cmd, home, cfg):
         return 1 if bad else 0
     if cmd == "report":
         from fxnews.report import run_report
+        from fxnews.stats import run_kata_report
         from fxnews.store import Store
 
         store = Store(cfg.data_dir / "fxnews.db")
         try:
-            run_report(store, days=args.days)
+            run_kata_report(store, out=say, min_importance=cfg.getint("notify", "min_importance"))
+            say("")
+            say("――――――――――――――――")
+            run_report(store, days=args.days, out=say)
         finally:
             store.close()
         return 0
@@ -478,6 +749,11 @@ def dispatch(args, cmd, home, cfg):
     from fxnews.single import Lock
 
     dry = getattr(args, "dry", False)
+    if not dry and getattr(args, "seconds", None) is None and not getattr(args, "auto", False):
+        try:  # 手で見張りを始めた。「止めたままにする」のしるしが残っていたら、片づける
+            (cfg.data_dir / AUTOSTART_OFF).unlink()
+        except OSError:
+            pass
     lock = None
     if not dry:  # お試しモード(スマホに送らない)は、本番が動いていても試せる
         lock = Lock(home, cfg.data_dir)

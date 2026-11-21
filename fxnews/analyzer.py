@@ -12,7 +12,7 @@ import logging
 import threading
 import time
 
-from .models import KIND_JA
+from .models import KIND_JA, Item
 from .net import HttpError, NetError, request
 from .rates import CCY_JA, PAIR_JA, PAIRS
 from .util import jst, utc_month
@@ -22,6 +22,69 @@ log = logging.getLogger("fxnews.analyzer")
 CATEGORIES = ("要人発言", "金融政策", "経済指標", "決算", "政治・国際情勢", "その他")
 DIRECTIONS = ("up", "down", "flat")
 CONFIDENCES = ("high", "mid", "low")
+
+# 型(= ニュースの種類につける、決まった名前)。あとから「この型のニュースのあと、ドル円はどう動いたか」を
+# 数えるための分け方。数えられるように、名前は固定する(増やす・分け直すときは、ここを直す)。
+# 表を作りかえたら KATA_VERSION を1つ上げる(どの版の表で分けた記録かを、あとで見分けるため)。
+KATA_VERSION = 1
+KATA_JA = {
+    "us_data": "米国の経済指標",
+    "fed_decision": "FRB(米国の中央銀行)の決定",
+    "fed_talk": "FRB の人の発言",
+    "boj_decision": "日本銀行の決定",
+    "boj_talk": "日本銀行の人の発言",
+    "jp_fx": "日本の当局の円安けん制・為替介入",
+    "jp_data": "日本の経済指標",
+    "us_politics": "米国の政治・財政",
+    "jp_politics": "日本の政治・財政",
+    "eu_uk_cb": "欧州・英国の中央銀行",
+    "eu_uk_data": "欧州・英国の経済指標",
+    "risk": "戦争・事故・金融不安",
+    "markets": "株・金利・原油の大きな動き",
+    "other": "その他",
+}
+# 型ごとの「向き」。型によって、使う言葉が決まっている。
+MUKI_JA = {
+    "strong": "予想より強い",
+    "weak": "予想より弱い",
+    "inline": "予想どおり",
+    "hawk": "引き締め寄り",
+    "dove": "ゆるめ寄り",
+    "talk": "口先のけん制",
+    "action": "実際の介入",
+    "plus": "その国の通貨に追い風",
+    "minus": "その国の通貨に向かい風",
+    "worse": "悪化",
+    "better": "やわらぐ",
+    "up": "上げ",
+    "down": "下げ",
+    "neutral": "どちらでもない",
+}
+KATA_MUKI = {
+    "us_data": ("strong", "weak", "inline"),
+    "jp_data": ("strong", "weak", "inline"),
+    "eu_uk_data": ("strong", "weak", "inline"),
+    "fed_decision": ("hawk", "dove", "neutral"),
+    "fed_talk": ("hawk", "dove", "neutral"),
+    "boj_decision": ("hawk", "dove", "neutral"),
+    "boj_talk": ("hawk", "dove", "neutral"),
+    "eu_uk_cb": ("hawk", "dove", "neutral"),
+    "jp_fx": ("talk", "action", "neutral"),
+    "us_politics": ("plus", "minus", "neutral"),
+    "jp_politics": ("plus", "minus", "neutral"),
+    "risk": ("worse", "better", "neutral"),
+    "markets": ("up", "down", "neutral"),
+    "other": ("neutral",),
+}
+
+
+def kata_label(kata, muki):
+    """型と向きを、日本語で言う(例: 米国の経済指標・予想より強い)。"""
+    if not kata or kata not in KATA_JA:
+        return ""
+    if muki and muki in MUKI_JA and muki != "neutral":
+        return "%s・%s" % (KATA_JA[kata], MUKI_JA[muki])
+    return KATA_JA[kata]
 
 NEWS_SYSTEM = """あなたは、日本の個人投資家(為替の初心者)に、為替相場に関係するニュースを速報する係です。
 入力されたニュース1件について、JSON だけを出力します。
@@ -38,12 +101,36 @@ NEWS_SYSTEM = """あなたは、日本の個人投資家(為替の初心者)に�
 - jpy / usd / eur / gbp: その通貨そのものが買われて上がりやすいなら "up"、売られて下がりやすいなら "down"、影響が小さい・読めないなら "flat"。
   例: 「円高」は jpy が "up"。「ドル安」は usd が "down"。
 - confidence: 向きの見立ての確からしさ。"high" "mid" "low" のどれか。
+- usdjpy: このニュースを受けて、これから1時間ほどのあいだ、ドル円(1ドルが何円か)が上がりやすいなら "up"、下がりやすいなら "down"、読めない・影響が小さいなら "flat"。
+- kata: ニュースの型。下の表の左の名前から1つ。
+- muki: 型ごとの向き。その型の行に書いてある言葉から1つ。
+- tag: 何の話かが分かる短い言葉。日本語で12字以内(例: 雇用統計、CPI、植田総裁、パウエル議長、関税、為替介入)。
 - importance: 為替への影響の大きさ。1〜5 の整数。
   5 = 相場が大きく動く可能性が高い(政策金利の変更、為替介入、重要な経済指標の大きな予想外、戦争や大災害、想定外の要人発言)
   4 = 動く可能性がある(中央銀行の総裁・議長の踏み込んだ発言、重要な経済指標、市場全体を動かす大企業の決算)
   3 = 知っておきたい(金融政策にかかわる要人の発言、中くらいの経済指標、政治・国際情勢の動き)
   2 = 影響は小さい
   1 = 為替とほぼ関係がない(人事、式典、事務的な手続き、個別企業の小さな話、宣伝、相場の感想だけの記事)
+
+# 型(kata)と向き(muki)の表
+| kata | どんなニュースか | muki に使う言葉 |
+| us_data | 米国の経済指標(雇用、物価、小売、景気の調査、GDP など)の結果 | strong = 予想より強い / weak = 予想より弱い / inline = 予想どおり・予想が書かれていない |
+| jp_data | 日本の経済指標(物価、賃金、GDP、短観 など)の結果 | strong / weak / inline |
+| eu_uk_data | ユーロ圏・英国の経済指標の結果 | strong / weak / inline |
+| fed_decision | FRB の政策の決定(金利、資産の買い入れ、声明、見通し、議事要旨) | hawk = 予想より引き締め寄り(利上げ寄り・利下げに慎重) / dove = 予想よりゆるめ寄り / neutral = 予想どおり |
+| fed_talk | FRB の議長・理事・地区連銀総裁の発言や講演 | hawk / dove / neutral |
+| boj_decision | 日本銀行の政策の決定(金利、国債の買い入れ、声明、展望、主な意見) | hawk = 利上げ寄り / dove = ゆるめ寄り / neutral |
+| boj_talk | 日本銀行の総裁・副総裁・審議委員の発言や講演 | hawk / dove / neutral |
+| eu_uk_cb | ECB・イングランド銀行の決定や、その人たちの発言 | hawk / dove / neutral |
+| jp_fx | 日本の財務省・政府による、円相場へのけん制や為替介入 | talk = 口先のけん制(「注視」「あらゆる手段」など) / action = 実際の介入・レートチェック / neutral |
+| us_politics | 米国の政治・財政(関税、予算、政府の閉鎖、FRB の人事、大統領の発言) | plus = ドルに追い風 / minus = ドルに向かい風 / neutral |
+| jp_politics | 日本の政治・財政(選挙、首相や大臣の交代、予算、国債) | plus = 円に追い風 / minus = 円に向かい風 / neutral |
+| risk | 戦争、テロ、大きな事故や災害、銀行の破綻などの金融不安 | worse = 悪化 / better = やわらぐ / neutral |
+| markets | 株・金利・原油・金などの大きな値動きそのものを伝える記事 | up = 上げ / down = 下げ / neutral |
+| other | 上のどれにも当てはまらない。為替と関係がうすい | neutral |
+- 2つ以上に当てはまるときは、為替への影響がいちばん大きい型を選ぶ。
+- 経済指標で、予想の数字が本文に書かれていなければ muki は inline にする(強い・弱いを、自分の知識で決めない)。
+- 講演や論文で、金融政策の向きに触れていなければ neutral にする。
 
 # きまり
 - reason を先に考えてから、向きを決める。
@@ -80,6 +167,10 @@ NEWS_SCHEMA = {
         "gbp": {"type": "string", "enum": list(DIRECTIONS)},
         "confidence": {"type": "string", "enum": list(CONFIDENCES)},
         "importance": {"type": "integer"},
+        "usdjpy": {"type": "string", "enum": list(DIRECTIONS)},
+        "kata": {"type": "string", "enum": list(KATA_JA)},
+        "muki": {"type": "string", "enum": list(MUKI_JA)},
+        "tag": {"type": "string"},
     },
     "required": [
         "dup",
@@ -93,6 +184,10 @@ NEWS_SCHEMA = {
         "gbp",
         "confidence",
         "importance",
+        "usdjpy",
+        "kata",
+        "muki",
+        "tag",
     ],
     "additionalProperties": False,
 }
@@ -103,6 +198,46 @@ SPIKE_SCHEMA = {
     "required": ["cause"],
     "additionalProperties": False,
 }
+
+
+def error_text(exc):
+    """Claude のエラーの返事から、理由の文(英語)を取り出す。取り出せなければ空文字。"""
+    try:
+        obj = json.loads(exc.body.decode("utf-8", errors="replace"))
+        return " ".join(str((obj.get("error") or {}).get("message", "")).split())
+    except (ValueError, AttributeError):
+        return ""
+
+
+def error_message(exc):
+    """理由の文を、見分けやすいように小文字にしたもの。"""
+    return error_text(exc).lower()
+
+
+def error_brief(exc):
+    """知らせに出す、短い形(例: HTTP 401・Claude からの返事「invalid x-api-key」)。"""
+    text = error_text(exc)
+    return "HTTP %s・Claude からの返事「%s」" % (exc.status, text[:110]) if text else str(exc)
+
+
+def is_credit_error(exc):
+    """前払いの残り(クレジット)や、支払いの都合で断られたのか。"""
+    msg = error_message(exc)
+    return exc.status in (400, 402, 403) and any(w in msg for w in ("credit", "billing", "balance", "payment"))
+
+
+def is_request_shape_error(exc):
+    """送り方(返事の形の指定、effort、thinking)が受けつけられなかったのかもしれない 400 か。
+
+    残りが足りない・ワークスペースが決まっていない、のように、送り方を変えても直らないと
+    はっきり分かるものは False。
+    """
+    if exc.status != 400 or is_credit_error(exc):
+        return False
+    msg = error_message(exc)
+    if any(w in msg for w in ("format", "schema", "effort", "thinking", "output_config")):
+        return True
+    return not any(w in msg for w in ("workspace", "api key", "api_key", "permission", "organization"))
 
 
 def extract_json(text):
@@ -148,6 +283,12 @@ def normalize_news(obj):
     title = s("title", 80)
     if not title:
         return None
+    kata = str(obj.get("kata", "other")).strip().lower()
+    if kata not in KATA_JA:
+        kata = "other"
+    muki = str(obj.get("muki", "")).strip().lower()
+    if muki not in KATA_MUKI[kata]:
+        muki = KATA_MUKI[kata][-1]  # その型で使えない言葉なら、「どちらでもない」にあたる言葉にする
     return {
         "dup": bool(obj.get("dup", False)),
         "category": category,
@@ -160,7 +301,28 @@ def normalize_news(obj):
         "gbp": direction("gbp"),
         "confidence": confidence,
         "importance": importance,
+        "usdjpy": direction("usdjpy"),
+        "kata": kata,
+        "muki": muki,
+        "tag": s("tag", 16),
+        "kata_ver": KATA_VERSION,
     }
+
+
+# 型分けの試しに使う、見本のニュース(作りもの)。予想より強い米国の雇用統計。
+SELFTEST_ITEM = Item(
+    source="selftest",
+    source_name="型分けの試し(見本)",
+    kind="news",
+    key="selftest",
+    title="US nonfarm payrolls +250K vs +180K expected; unemployment rate 4.0% vs 4.2% expected",
+    text=(
+        "US nonfarm payrolls rose by 250K in the latest month, well above the 180K consensus estimate. "
+        "The unemployment rate fell to 4.0% against 4.2% expected. "
+        "Average hourly earnings rose 0.4% m/m versus 0.3% expected. (This is a made-up sample used for a self-test.)"
+    ),
+)
+SELFTEST_EXPECT = ("us_data", "strong")
 
 
 def build_news_prompt(item, recent_titles, context="", now=None):
@@ -236,6 +398,7 @@ class Analyzer:
         self._use_tuning = True  # effort と thinking の指定を使うか
         self._paused_until = 0.0
         self.last_error = ""
+        self.blocked = ""  # 鍵が受けつけられない・残りが足りない、で止まっているなら、その理由(直るまで続く)
 
     def available(self):
         return bool(self.key)
@@ -247,9 +410,9 @@ class Analyzer:
         return self.cap_yen > 0 and self.spent_yen() >= self.cap_yen
 
     # ---- 送る ----
-    def _headers(self):
+    def _headers(self, legacy=None):
         h = {"anthropic-version": self.version, "content-type": "application/json"}
-        if self._legacy_auth:
+        if self._legacy_auth if legacy is None else legacy:
             h["x-api-key"] = self.key
         else:
             h["Authorization"] = "Bearer %s" % self.key
@@ -257,51 +420,71 @@ class Analyzer:
             h["anthropic-workspace-id"] = self.workspace
         return h
 
-    def _body(self, system, user, schema, max_tokens):
+    def _body(self, system, user, schema, max_tokens, use_format=None, use_tuning=None):
+        use_format = self._use_format if use_format is None else use_format
+        use_tuning = self._use_tuning if use_tuning is None else use_tuning
+        quick = use_tuning and self.thinking_off  # 返事の前の「考える時間」を止められているか
         body = {
             "model": self.model,
-            "max_tokens": max_tokens,
+            # 考える時間を止められないときは、考える分の余裕を足す(足りないと、返事が途中で切れる)
+            "max_tokens": max_tokens if quick else max_tokens + 1200,
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }
         out_cfg = {}
-        if self._use_tuning and self.effort in ("low", "medium", "high", "xhigh", "max"):
+        if use_tuning and self.effort in ("low", "medium", "high", "xhigh", "max"):
             out_cfg["effort"] = self.effort
-        if schema is not None and self._use_format:
+        if schema is not None and use_format:
             out_cfg["format"] = {"type": "json_schema", "schema": schema}
         if out_cfg:
             body["output_config"] = out_cfg
-        if self._use_tuning and self.thinking_off:
+        if quick:
             body["thinking"] = {"type": "disabled"}
         return body
 
     def _post(self, system, user, schema, max_tokens):
-        """1回送って (返事の文章, 使った量) を返す。うまくいかなければ例外。"""
+        """1回送って (返事の文章, 使った量) を返す。うまくいかなければ例外。
+
+        送り方が受けつけられなかったときは、古い形の見出し → 返事の形の指定なし → effort と thinking の
+        指定なし、の順にやり直す。やり直してうまくいった形だけを、次からも使う
+        (残りが足りない、のような別の理由のエラーで、送り方を変えてしまわないため)。
+        """
+        legacy, use_format, use_tuning = self._legacy_auth, self._use_format, self._use_tuning
+        first = None
+        resp = None
         for _ in range(4):
             try:
                 resp = request(
                     self.base + "/v1/messages",
                     method="POST",
-                    headers=self._headers(),
-                    data=self._body(system, user, schema, max_tokens),
+                    headers=self._headers(legacy),
+                    data=self._body(system, user, schema, max_tokens, use_format, use_tuning),
                     timeout=40,
                 )
                 break
             except HttpError as exc:
-                if exc.status == 401 and not self._legacy_auth:
-                    self._legacy_auth = True  # 古い形の見出し(x-api-key)でもう一度
+                first = first or exc
+                if exc.status == 401 and not legacy:
+                    legacy = True  # 古い形の見出し(x-api-key)でもう一度
                     continue
-                if exc.status == 400 and schema is not None and self._use_format:
-                    log.warning("返事の形の指定が受けつけられなかったので、指定なしでやり直します: %s", exc)
-                    self._use_format = False
-                    continue
-                if exc.status == 400 and self._use_tuning:
-                    log.warning("effort / thinking の指定が受けつけられなかったので、指定なしでやり直します: %s", exc)
-                    self._use_tuning = False
-                    continue
-                raise
-        else:
-            raise HttpError(400, b"retry exhausted", {}, self.base)
+                if is_request_shape_error(exc):
+                    if schema is not None and use_format:
+                        use_format = False
+                        continue
+                    if use_tuning:
+                        use_tuning = False
+                        continue
+                raise first
+        if resp is None:
+            raise first or HttpError(400, b"retry exhausted", {}, self.base)
+        if legacy:
+            self._legacy_auth = True
+        if self._use_format and not use_format:
+            log.warning("返事の形の指定が受けつけられなかったので、これからは指定なしで送ります: %s", first)
+            self._use_format = False
+        if self._use_tuning and not use_tuning:
+            log.warning("effort / thinking の指定が受けつけられなかったので、これからは指定なしで送ります: %s", first)
+            self._use_tuning = False
         data = resp.json()
         texts = [b.get("text", "") for b in data.get("content", []) if isinstance(b, dict) and b.get("type") == "text"]
         usage = data.get("usage", {}) or {}
@@ -324,14 +507,18 @@ class Analyzer:
             return None, "Claude の今月の上限(%d円)に達した" % int(self.cap_yen)
         if time.time() < self._paused_until:
             return None, "Claude を一時停止中(%s)" % self.last_error
-        tokens = max_tokens if self.thinking_off and self._use_tuning else max_tokens + 1200
         try:
-            text, usage = self._post(system, user, schema, tokens)
+            text, usage = self._post(system, user, schema, max_tokens)
         except HttpError as exc:
             self.last_error = str(exc)
+            if is_credit_error(exc):
+                self._paused_until = time.time() + 600
+                self.blocked = "Claude の前払いの残り(クレジット)が足りないようです(%s)" % error_brief(exc)
+                return None, self.blocked
             if exc.status in (401, 403):
                 self._paused_until = time.time() + 600
-                return None, "Claude の鍵が受けつけられません(%s)" % exc
+                self.blocked = "Claude の鍵が受けつけられません(%s)" % error_brief(exc)
+                return None, self.blocked
             if exc.status == 429:
                 self._paused_until = time.time() + 30
             elif exc.status >= 500:
@@ -340,6 +527,7 @@ class Analyzer:
         except (NetError, ValueError) as exc:
             self.last_error = str(exc)
             return None, "Claude につながりません(%s)" % exc
+        self.blocked = ""
         obj = extract_json(text)
         if obj is None:
             return None, "Claude の返事を読めませんでした(%s)" % " ".join(text.split())[:80]
@@ -349,7 +537,7 @@ class Analyzer:
     # ---- ニュース ----
     def analyze_news(self, item, recent_titles):
         """ニュース1件に解説と分類をつける。戻り値は (結果の dict か None, だめだった理由)。"""
-        obj, why = self._ask(NEWS_SYSTEM, build_news_prompt(item, recent_titles, self.context), NEWS_SCHEMA, 700)
+        obj, why = self._ask(NEWS_SYSTEM, build_news_prompt(item, recent_titles, self.context), NEWS_SCHEMA, 800)
         if obj is None:
             return None, why
         res = normalize_news(obj)
@@ -368,13 +556,27 @@ class Analyzer:
         return cause, ""
 
     # ---- 点検 ----
+    def selftest(self):
+        """型分けの試し: 見本のニュース(予想より強い米国の雇用統計)を1件分けてもらい、思ったとおりに分かれるかを見る。
+
+        戻り値は (うまくいったか, 説明の文)。記録や通知には、何も残さない(使った料金だけ数える)。
+        """
+        res, why = self.analyze_news(SELFTEST_ITEM, [])
+        if res is None:
+            return False, "型分けの試しが、できませんでした(%s)" % why
+        got = "%s｜ドル円の見立て %s｜%s" % (kata_label(res["kata"], res["muki"]) or res["kata"], res["usdjpy"], res["title"])
+        how = "返事の形の指定%s" % ("あり" if self._use_format else "なし")
+        if (res["kata"], res["muki"]) != SELFTEST_EXPECT:
+            return False, "型分けの試しが、思った型(%s)になりませんでした: %s(%s)" % (kata_label(*SELFTEST_EXPECT), got, how)
+        return True, "型分けの試し: %s(%s)" % (got, how)
+
     def ping(self):
         """鍵が使えるかを、ごく短いやりとりで確かめる。戻り値は (成功か, 説明)。"""
         if not self.available():
             return False, "鍵が未設定"
         start = time.time()
         try:
-            text, usage = self._post("「OK」とだけ答えてください。", "テスト", None, 1300 if not self.thinking_off else 30)
+            text, usage = self._post("「OK」とだけ答えてください。", "テスト", None, 100)
         except HttpError as exc:
             return False, "エラー: %s" % exc
         except (NetError, ValueError) as exc:

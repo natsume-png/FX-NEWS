@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from fxnews import __version__  # noqa: E402
 from fxnews.analyzer import Analyzer  # noqa: E402
 from fxnews.app import App  # noqa: E402
 from fxnews.check import run_check  # noqa: E402
@@ -428,7 +429,7 @@ class OperationTest(unittest.TestCase):
 
             code, out = call("run", "--dry", "--replay", "1", "--seconds", "1.5")
             self.assertEqual(code, 0, out)
-            self.assertIn("FX見張り番 0.2.0 を始めます", out)
+            self.assertIn("FX見張り番 %s を始めます" % __version__, out)
             self.assertIn("[通知] 円↓ ドル↑｜FRB理事が追加の利上げに言及", out)
             self.assertIn("(お試しモード: 送っていません)", out)
             self.assertIn("[おわり]", out)

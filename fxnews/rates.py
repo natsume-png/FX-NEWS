@@ -5,12 +5,14 @@
 """
 
 import collections
+import datetime as dt
 import logging
 import threading
 import time
 
 from .models import Item
 from .net import HttpError, NetError, Session
+from .util import JST
 
 log = logging.getLogger("fxnews.rates")
 
@@ -29,10 +31,44 @@ UNIT_JA = {"JPY": "円", "USD": "ドル", "GBP": "ポンド"}
 WINDOWS = ((60, "1分"), (300, "5分"), (900, "15分"))
 
 
+class Maintenance(ValueError):
+    """レートの配信が点検中(メンテナンス)。故障ではないので、「つながりません」とは知らせない。"""
+
+
+def looks_like_maintenance(text):
+    """返事の文面が、点検中の知らせか。
+
+    GMOコインの公式説明(2026年11月22日に確認)では、点検中は状態が MAINTENANCE になり、
+    エラーの番号 ERR-5201 が返る。毎週土曜の 9:00〜11:00(日本時間)が定期の点検。
+    """
+    upper = str(text or "").upper()
+    return "ERR-5201" in upper or "MAINTENANCE" in upper
+
+
+def weekend_closed(ts=None):
+    """週末で、相場が閉まっている時間帯か(日本時間の 土曜 5:00 〜 月曜 7:10)。
+
+    この時間帯は、レートが取れなくても困らないので、「つながりません」とは知らせない。
+    閉まる時刻は夏時間と冬時間で1時間ちがうので、早いほう(土曜 5:59)より少し前から、広めにとっている。
+    """
+    d = dt.datetime.fromtimestamp(time.time() if ts is None else ts, JST)
+    minutes = d.hour * 60 + d.minute
+    wd = d.weekday()  # 月曜 = 0 … 土曜 = 5、日曜 = 6
+    if wd == 5:
+        return minutes >= 5 * 60
+    if wd == 6:
+        return True
+    if wd == 0:
+        return minutes < 7 * 60 + 10
+    return False
+
+
 def parse_ticker(payload):
     """GMOコインの返事を {通貨ペア: 売値と買値の真ん中} と、取引時間中のペアの集合にする。"""
     if isinstance(payload, dict):
         if payload.get("status") not in (0, "0", None):
+            if looks_like_maintenance(json_text(payload)):
+                raise Maintenance("レートの配信は点検中です")
             raise ValueError("レートの配信がエラーを返しました: %s" % str(payload)[:200])
         rows = payload.get("data") or []
     else:
@@ -54,6 +90,13 @@ def parse_ticker(payload):
         if str(row.get("status", "OPEN")).upper() == "OPEN":
             open_pairs.add(sym)
     return mids, open_pairs
+
+
+def json_text(payload):
+    try:
+        return str(payload.get("messages") or "") + str(payload.get("data") or "")
+    except AttributeError:
+        return str(payload)
 
 
 def pct_change(base, now):
@@ -155,6 +198,61 @@ class RateBook:
     def __len__(self):
         with self._lock:
             return len(self._samples)
+
+
+class BarMaker:
+    """ならした値から、1分ごとの4つの値(始めの値・いちばん高い値・いちばん安い値・終わりの値)を作る。
+
+    1分が終わるたびに、その分の値を sink(記録の係)に渡す。
+    あとから「ニュースの何分後に、いくらだったか」を、何分後でも引けるようにするため。
+    """
+
+    def __init__(self, sink):
+        self.sink = sink
+        self._minute = None
+        self._bars = {}  # ペア -> [始めの値, 高い値, 安い値, 終わりの値, 回数]
+        self._lock = threading.Lock()
+        self.saved = 0  # 記録に渡した本数
+
+    def add(self, ts, mids, pairs=None):
+        minute = int(ts // 60) * 60
+        with self._lock:
+            done = self._take() if self._minute is not None and minute != self._minute else None
+            self._minute = minute
+            for pair, v in mids.items():
+                if pairs is not None and pair not in pairs:
+                    continue
+                bar = self._bars.get(pair)
+                if bar is None:
+                    self._bars[pair] = [v, v, v, v, 1]
+                else:
+                    bar[1] = max(bar[1], v)
+                    bar[2] = min(bar[2], v)
+                    bar[3] = v
+                    bar[4] += 1
+        self._save(done)
+
+    def flush(self):
+        """作りかけの分も、いまの時点の値で記録に渡す(止めるとき用)。"""
+        with self._lock:
+            done = self._take()
+        self._save(done)
+
+    def _take(self):
+        if self._minute is None or not self._bars:
+            return None
+        rows = [(self._minute, pair, b[0], b[1], b[2], b[3], b[4]) for pair, b in sorted(self._bars.items())]
+        self._bars = {}
+        return rows
+
+    def _save(self, rows):
+        if not rows:
+            return
+        try:
+            self.sink(rows)
+            self.saved += len(rows)
+        except Exception:
+            log.exception("1分ごとの値を、記録できませんでした")
 
 
 class SpikeDetector:
@@ -297,7 +395,7 @@ def spike_item(sp):
 
 
 class RatesPoller(threading.Thread):
-    def __init__(self, url, interval, detector, book, emit, stop, health=None):
+    def __init__(self, url, interval, detector, book, emit, stop, health=None, bars=None):
         super().__init__(name="rates", daemon=True)
         self.url = url
         self.interval = float(interval)
@@ -306,6 +404,8 @@ class RatesPoller(threading.Thread):
         self.emit = emit
         self.stop_event = stop
         self.health = health
+        self.bars = bars  # 1分ごとの値を作る係(BarMaker)。なければ作らない
+        self.maintenance = False  # いま、配信が点検中か
         self.open_pairs = set()
         self.last_ok = 0.0
         self.last_wire = 0
@@ -322,8 +422,12 @@ class RatesPoller(threading.Thread):
         now = time.time()
         self.open_pairs = open_pairs
         self.last_ok = now
+        self.maintenance = False
         if open_pairs:
             self.book.add(now, mids)
+            if self.bars is not None:
+                _ts, smooth = self.book.latest()
+                self.bars.add(now, smooth, open_pairs)
             return self.detector.check(now, open_pairs)
         return None
 
@@ -335,6 +439,8 @@ class RatesPoller(threading.Thread):
         return dict(mids)
 
     def close(self):
+        if self.bars is not None:
+            self.bars.flush()
         self.session.close()
 
     def run(self):
@@ -356,8 +462,26 @@ class RatesPoller(threading.Thread):
                     self.health.ok("rates")
                 delay = self.interval if self.open_pairs else 60.0
             except (NetError, HttpError, ValueError) as exc:
+                body = getattr(exc, "body", b"") or b""
+                if isinstance(exc, Maintenance) or looks_like_maintenance(body.decode("utf-8", errors="replace")):
+                    # 点検中。故障ではないので、閉まっている時間と同じにあつかう(1分おきに、明けたかを見る)
+                    if not self.maintenance:
+                        log.info("為替レート: 配信が点検中です(明けるまで、1分おきに見ます)")
+                    self.maintenance = True
+                    self.open_pairs = set()
+                    fails = 0
+                    delay = 60.0
+                    if self.health:
+                        self.health.ok("rates")
+                    continue
                 fails += 1
                 delay = min(60.0, self.interval * (2 ** min(fails, 5)))
+                if weekend_closed():
+                    # 週末で相場が閉まっている。レートが取れなくても困らないので、知らせない
+                    self.open_pairs = set()
+                    if fails == 1 or fails % 120 == 0:
+                        log.info("為替レート: 取れませんでした(週末で相場が閉まっている時間なので、知らせません。%s)", exc)
+                    continue
                 if self.health:
                     self.health.fail("rates", "為替レート", str(exc))
                 if fails in (1, 5) or fails % 30 == 0:
